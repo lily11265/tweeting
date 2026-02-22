@@ -129,7 +129,8 @@ class AnalysisTabMixin:
         ttk.Label(frm_info, text="종 음원을 자가진단하여 최적 가중치를 자동 결정합니다.",
                   font=("Arial", 12, "bold")).pack(anchor="w")
         ttk.Label(frm_info,
-                  text="종 음원 내 울음 구간(양성)과 비울음 구간(음성)의 5가지 지표 차이를 분석하여\n"
+                  text="스펙트로그램에서 새소리 구간을 2곳 이상 선택하면,\n"
+                       "선택한 구간과 유사한 음을 양성, 나머지를 음성으로 분류하여\n"
                        "변별력이 높은 지표에 더 큰 가중치를 부여합니다.",
                   foreground="gray").pack(anchor="w", pady=(2, 0))
 
@@ -189,6 +190,13 @@ class AnalysisTabMixin:
             include_cutoff=False,
             include_weights=False,
         )
+        # 다중 구간 선택 버튼 추가
+        multi_btn = ttk.Button(
+            sp_info["frame"],
+            text="📊 새소리 구간 다중 선택 (자동 튜닝용)",
+            command=lambda sp=sp_info: self._open_multi_template_selector(sp),
+        )
+        multi_btn.pack(fill="x", pady=(3, 0))
         self.at_species_frames.append(sp_info)
 
     def _at_remove_species(self):
@@ -200,19 +208,28 @@ class AnalysisTabMixin:
         """자동 튜닝 실행"""
         species_data = []
         for sp in self.at_species_frames:
-            # C5: auto_tune은 첫 번째 템플릿만 사용
             if not sp["templates"]:
                 continue
-            tmpl = sp["templates"][0]
-            wav_path = tmpl["path"].get().strip()
-            if wav_path and os.path.isfile(wav_path):
+            # 모든 템플릿 수집
+            tmpls = []
+            wav_path = None
+            for tmpl in sp["templates"]:
+                tp = tmpl["path"].get().strip()
+                if tp and os.path.isfile(tp):
+                    if wav_path is None:
+                        wav_path = tp
+                    tmpls.append({
+                        "wav_path": tp,
+                        "t_start": tmpl["t_start"].get(),
+                        "t_end":   tmpl["t_end"].get(),
+                        "f_low":   tmpl["f_low"].get(),
+                        "f_high":  tmpl["f_high"].get(),
+                    })
+            if tmpls:
                 species_data.append({
-                    "name":    sp["name"].get().strip(),
-                    "wav_path": wav_path,
-                    "t_start": tmpl["t_start"].get(),
-                    "t_end":   tmpl["t_end"].get(),
-                    "f_low":   tmpl["f_low"].get(),
-                    "f_high":  tmpl["f_high"].get(),
+                    "name":      sp["name"].get().strip(),
+                    "wav_path":  wav_path,  # 하위 호환용
+                    "templates": tmpls,
                 })
 
         if not species_data:
@@ -245,6 +262,10 @@ class AnalysisTabMixin:
                     self.root.after(0, self._at_log,
                                    f"  ✅ {sp['name']} 음원 전처리 완료\n")
                 sp["wav_path"] = converted
+                # 템플릿별 wav_path도 갱신
+                for tmpl in sp.get("templates", []):
+                    if tmpl["wav_path"] == original:
+                        tmpl["wav_path"] = converted
 
             # config.json 생성 (auto_tune 모드)
             config = {
@@ -337,8 +358,10 @@ class AnalysisTabMixin:
 
             diag = res.get("diagnostics", {})
             if diag:
+                n_tmpl = diag.get("n_templates", 1)
                 self.at_txt_result.insert("end",
-                    f"  분석: 양성 {diag.get('n_positive', 0)}건, "
+                    f"  분석: 템플릿 {n_tmpl}개, "
+                    f"양성 {diag.get('n_positive', 0)}건, "
                     f"음성 {diag.get('n_negative', 0)}건\n\n")
 
             w = res.get("weights", {})
@@ -466,6 +489,60 @@ class AnalysisTabMixin:
             var_f_high.set(round(f1, 0))
 
         _TemplateSelector(self.root, wav_path, on_selected)
+
+    def _open_multi_template_selector(self, sp_info):
+        """다중 구간 선택: 스펙트로그램에서 여러 새소리 구간을 선택하여 템플릿으로 등록"""
+        # 첫 번째 템플릿의 파일 경로 사용
+        if not sp_info["templates"]:
+            messagebox.showwarning("경고", "먼저 음원 파일을 선택하세요.")
+            return
+        first_tmpl = sp_info["templates"][0]
+        file_path = first_tmpl["path"].get().strip()
+        if not file_path or not os.path.isfile(file_path):
+            messagebox.showwarning("파일 없음", "먼저 종 음원 파일을 선택하세요.")
+            return
+
+        # WAV 변환/sanitize
+        wav_path = file_path
+        try:
+            tmp_dir = Path(tempfile.mkdtemp(prefix="birdsong_msel_"))
+            wav_path, _log = ensure_wav(file_path, tmp_dir)
+        except Exception:
+            wav_path = file_path
+
+        def on_multi_selected(selections):
+            """다중 선택 콜백: 선택된 구간들로 템플릿 행 생성"""
+            templates = sp_info["templates"]
+            # 첫 번째 선택 → 첫 번째 템플릿에 적용
+            t0, t1, f0, f1 = selections[0]
+            templates[0]["t_start"].set(round(t0, 2))
+            templates[0]["t_end"].set(round(t1, 2))
+            templates[0]["f_low"].set(round(f0, 0))
+            templates[0]["f_high"].set(round(f1, 0))
+            templates[0]["label"].set("call1")
+
+            # 나머지 선택 → 추가 템플릿 행 생성
+            # 기존 추가 템플릿 제거 (2번째부터)
+            while len(templates) > 1:
+                old = templates.pop()
+                old["frame"].destroy()
+
+            for i, (t0, t1, f0, f1) in enumerate(selections[1:], start=2):
+                from ui.species_form import _create_template_row
+                tmpl_container = templates[0]["frame"].master
+                tmpl = _create_template_row(
+                    tmpl_container, i,
+                    on_template_select=self._open_template_selector,
+                )
+                tmpl["path"].set(file_path)
+                tmpl["t_start"].set(round(t0, 2))
+                tmpl["t_end"].set(round(t1, 2))
+                tmpl["f_low"].set(round(f0, 0))
+                tmpl["f_high"].set(round(f1, 0))
+                tmpl["label"].set(f"call{i}")
+                templates.append(tmpl)
+
+        _TemplateSelector(self.root, wav_path, on_multi_selected, multi_select=True)
 
     def _remove_species(self):
         if len(self.species_frames) > 1:
