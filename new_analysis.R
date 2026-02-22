@@ -638,131 +638,195 @@ nms_detections <- function(df, min_gap = 0.5) {
 #' @param f_low 주파수 하한 (kHz)
 #' @param f_high 주파수 상한 (kHz)
 #' @return list(weights=list(...), diagnostics=list(...))
-auto_tune_weights <- function(wav, t_start, t_end, f_low, f_high) {
+auto_tune_weights <- function(wav, templates_info) {
+  # templates_info: list of list(t_start, t_end, f_low, f_high)
+  # 사용자가 스펙트로그램에서 직접 선택한 새소리 구간들
   sr <- wav@samp.rate
   total_duration <- length(wav@left) / sr
-  ref_duration <- t_end - t_start
 
-  log_info("★ 자동 튜닝 시작")
-  log_info(sprintf("  종 음원: %.1f초, 템플릿: %.1f~%.1f초 (%.2f초)",
-                    total_duration, t_start, t_end, ref_duration))
+  n_templates <- length(templates_info)
+  log_info(sprintf("★ 자동 튜닝 시작 (템플릿 %d개, 유사도 기반 분류)", n_templates))
+  log_info(sprintf("  종 음원: %.1f초", total_duration))
 
-  # 1) 레퍼런스 세그먼트 추출
-  ref_seg <- extract_segment(wav, t_start, t_end)
-  if (is.null(ref_seg)) {
+  # 1) 모든 템플릿 세그먼트 추출
+  ref_segments <- list()
+  ref_f_ranges <- list()
+  valid_templates <- 0
+
+  for (ti in seq_along(templates_info)) {
+    tmpl <- templates_info[[ti]]
+    t_s <- tmpl$t_start
+    t_e <- tmpl$t_end
+    f_l <- tmpl$f_low
+    f_h <- tmpl$f_high
+
+    log_info(sprintf("  템플릿 #%d: %.2f~%.2f초, %s~%s Hz",
+                      ti, t_s, t_e, f_l, f_h))
+
+    seg <- extract_segment(wav, t_s, t_e)
+    if (!is.null(seg)) {
+      valid_templates <- valid_templates + 1
+      ref_segments[[valid_templates]] <- seg
+      ref_f_ranges[[valid_templates]] <- list(f_low = f_l, f_high = f_h)
+    }
+  }
+
+  if (valid_templates < 1) {
     log_error("  템플릿 구간 추출 실패")
     return(list(weights = DEFAULT_WEIGHTS, diagnostics = NULL))
   }
 
-  # 2) B2: 에너지 프로필 벡터화 — spectro() 한 번으로 전체 계산
-  log_info("  에너지 프로필 계산 중 (spectro 벡터화)...")
-  spec_data <- tryCatch({
-    spectro(wav, f = sr, wl = 512, ovlp = 50, plot = FALSE)
-  }, error = function(e) {
-    log_info(sprintf("  spectro 벡터화 실패 → 루프 펴백: %s", e$message))
-    NULL
-  })
+  # 대표 주파수 범위 (전체 템플릿의 합집합)
+  all_f_low  <- min(sapply(ref_f_ranges, function(r) r$f_low))
+  all_f_high <- max(sapply(ref_f_ranges, function(r) r$f_high))
 
-  if (!is.null(spec_data)) {
-    freq_vec   <- spec_data$freq    # kHz
-    band_mask  <- freq_vec >= f_low & freq_vec <= f_high
-    amp_sq     <- spec_data$amp^2
-    col_energy <- colSums(amp_sq)
-    col_band   <- colSums(amp_sq[band_mask, , drop = FALSE])
-    safe_denom <- pmax(col_energy, 1e-12)
-    time_ratio <- col_band / safe_denom  # 시간 프레임별 대역 에너지 비율
+  # 대표 윈도우 길이 (템플릿 평균 길이)
+  ref_durations <- sapply(templates_info, function(t) t$t_end - t$t_start)
+  window_dur <- mean(ref_durations)
 
-    # spectro 시간축을 프레임으로 매핑
-    n_spec_frames <- length(time_ratio)
-    spec_times    <- seq(0, total_duration, length.out = n_spec_frames)
+  # 2) 슬라이딩 윈도우로 전체 음원 스캔
+  step <- window_dur * 0.5  # 50% 중첩
+  n_windows <- floor((total_duration - window_dur) / step)
 
-    frame_dur <- 0.1
-    n_frames  <- floor(total_duration / frame_dur)
-    band_energies <- numeric(n_frames)
-    for (fi in seq_len(n_frames)) {
-      t_mid <- (fi - 0.5) * frame_dur
-      idx   <- which.min(abs(spec_times - t_mid))
-      band_energies[fi] <- time_ratio[idx]
+  if (n_windows < 3) {
+    log_info("  ⚠ 음원이 너무 짧아 윈도우 분석 불가")
+    return(list(weights = DEFAULT_WEIGHTS, diagnostics = list(
+      n_positive = 0, n_negative = 0,
+      message = "음원이 너무 짧습니다"
+    )))
+  }
+
+  log_info(sprintf("  슬라이딩 윈도우: %d개 (%.2f초 간격)", n_windows, step))
+
+  # 3) 각 윈도우에 대해 모든 템플릿과의 MFCC 유사도 계산
+  #    → 최대 유사도로 양성/음성 분류
+  log_info("  유사도 기반 양성/음성 분류 중...")
+  window_max_sims <- numeric(n_windows)
+  window_starts   <- numeric(n_windows)
+
+  for (wi in seq_len(n_windows)) {
+    w_start <- (wi - 1) * step
+    w_end   <- w_start + window_dur
+    window_starts[wi] <- w_start
+
+    # 모든 템플릿 구간과 겹치는지 확인
+    overlaps_any <- FALSE
+    for (ti in seq_along(templates_info)) {
+      tmpl <- templates_info[[ti]]
+      overlap <- max(0, min(tmpl$t_end, w_end) - max(tmpl$t_start, w_start))
+      if (overlap / window_dur > 0.5) {
+        overlaps_any <- TRUE
+        break
+      }
     }
-  } else {
-    # 펴백: 기존 루프 방식
-    frame_dur <- 0.1
-    n_frames  <- floor(total_duration / frame_dur)
-    band_energies <- numeric(n_frames)
-    for (fi in seq_len(n_frames)) {
-      seg_s <- (fi - 1) * frame_dur
-      seg_e <- fi * frame_dur
-      seg   <- extract_segment(wav, seg_s, seg_e)
-      if (!is.null(seg)) {
-        band_energies[fi] <- compute_band_energy_ratio(seg, f_low, f_high)
+
+    if (overlaps_any) {
+      # 템플릿 자체와 겹치는 윈도우 → 유사도 1.0 (확정 양성)
+      window_max_sims[wi] <- 1.0
+      next
+    }
+
+    seg <- extract_segment(wav, w_start, w_end)
+    if (is.null(seg) || length(seg@left) < 100) {
+      window_max_sims[wi] <- 0.0
+      next
+    }
+
+    # 모든 템플릿과의 MFCC 코사인 유사도 중 최댓값
+    max_sim <- 0
+    for (ri in seq_along(ref_segments)) {
+      sim <- tryCatch(
+        compute_mfcc_similarity(ref_segments[[ri]], seg),
+        error = function(e) 0
+      )
+      if (sim > max_sim) max_sim <- sim
+    }
+    window_max_sims[wi] <- max_sim
+  }
+
+  # 4) 유사도 기반 양성/음성 분류
+  #    템플릿과 겹치는 윈도우(sim=1.0)는 확정 양성
+  #    나머지: 템플릿 간 유사도의 중간값을 임계값으로 사용
+  template_self_sims <- c()
+  if (valid_templates >= 2) {
+    # 템플릿끼리의 유사도 계산 (양성 기준선)
+    for (i in 1:(valid_templates - 1)) {
+      for (j in (i + 1):valid_templates) {
+        sim <- tryCatch(
+          compute_mfcc_similarity(ref_segments[[i]], ref_segments[[j]]),
+          error = function(e) 0.5
+        )
+        template_self_sims <- c(template_self_sims, sim)
       }
     }
   }
 
-  # 3) 슬라이딩 윈도우로 양성/음성 구간 수집
-  window_dur <- ref_duration
-  step <- ref_duration * 0.5  # 50% 중첩
-  n_windows <- floor((total_duration - window_dur) / step)
-
-  # ★ FIX: 임계값을 윈도우 단위 평균으로 계산 (기존: 100ms 프레임 단위 → 비교 스케일 불일치)
-  # 윈도우 하나에 약 (ref_duration / frame_dur)개의 프레임이 포함되므로
-  # 프레임별 70th percentile과 윈도우 평균은 스케일이 달라 양성이 0이 되는 문제가 있었음
-  window_mean_energies <- numeric(n_windows)
-  for (wi in seq_len(n_windows)) {
-    w_s <- (wi - 1) * step
-    fs  <- max(1, floor(w_s / frame_dur) + 1)
-    fe  <- min(n_frames, ceiling((w_s + window_dur) / frame_dur))
-    window_mean_energies[wi] <- mean(band_energies[fs:fe])
+  # 임계값: 템플릿 간 유사도가 있으면 그 최솟값의 90%, 없으면 0.65
+  if (length(template_self_sims) > 0) {
+    sim_threshold <- min(template_self_sims) * 0.9
+    log_info(sprintf("  템플릿 간 유사도: %.3f~%.3f → 양성 임계값: %.3f",
+                      min(template_self_sims), max(template_self_sims), sim_threshold))
+  } else {
+    sim_threshold <- 0.65
+    log_info(sprintf("  단일 템플릿 → 양성 임계값: %.3f (기본값)", sim_threshold))
   }
-  # 에너지 임계값: 윈도우 단위 상위 30%를 울음 구간으로 추정
-  energy_thresh <- quantile(window_mean_energies, 0.70)
-  log_debug(sprintf("  윈도우 에너지 임계값(70th): %.6f (전체범위 %.6f~%.6f)",
-                     energy_thresh,
-                     min(window_mean_energies), max(window_mean_energies)))
 
+  # 비겹침 윈도우의 유사도 분포 로깅
+  non_overlap_sims <- window_max_sims[window_max_sims < 1.0]
+  if (length(non_overlap_sims) > 0) {
+    log_info(sprintf("  비템플릿 윈도우 유사도: min=%.3f, median=%.3f, max=%.3f",
+                      min(non_overlap_sims), median(non_overlap_sims), max(non_overlap_sims)))
+  }
+
+  # 5) 양성/음성 구간에서 6가지 지표 계산
   positive_scores <- list()
   negative_scores <- list()
   n_pos <- 0
   n_neg <- 0
-  max_samples <- 20  # 최대 샘플 수 (속도 제한)
+  max_samples <- 20
 
-  log_info(sprintf("  슬라이딩 윈도우: %d개 (%.2f초 간격)", n_windows, step))
+  for (wi in seq_len(n_windows)) {
+    if (n_pos >= max_samples && n_neg >= max_samples) break
 
-  for (wi in seq_len(min(n_windows, max_samples * 3))) {
-    w_start <- (wi - 1) * step
+    w_start <- window_starts[wi]
     w_end   <- w_start + window_dur
+    sim     <- window_max_sims[wi]
 
-    # 템플릿 구간과 겹치는지 확인
-    overlap <- max(0, min(t_end, w_end) - max(t_start, w_start))
-    overlap_ratio <- overlap / window_dur
+    is_positive <- sim >= sim_threshold
+    is_negative <- sim < sim_threshold * 0.7  # 명확한 음성만 사용
 
-    # 50% 이상 겹치면 건너뜀 (자기 자신과의 비교 방지)
-    if (overlap_ratio > 0.5) next
+    if (is_positive && n_pos >= max_samples) next
+    if (!is_positive && n_neg >= max_samples) next
+    if (!is_positive && !is_negative) next  # 경계 구간은 건너뜀
 
     seg <- extract_segment(wav, w_start, w_end)
     if (is.null(seg) || length(seg@left) < 100) next
 
-    # ★ FIX: 윈도우 단위 에너지를 미리 계산된 window_mean_energies에서 직접 조회
-    mean_energy <- window_mean_energies[wi]
+    # 가장 유사한 템플릿을 레퍼런스로 사용
+    best_ref_idx <- 1
+    best_sim <- 0
+    for (ri in seq_along(ref_segments)) {
+      s <- tryCatch(
+        compute_mfcc_similarity(ref_segments[[ri]], seg),
+        error = function(e) 0
+      )
+      if (s > best_sim) {
+        best_sim <- s
+        best_ref_idx <- ri
+      }
+    }
+    ref_seg <- ref_segments[[best_ref_idx]]
+    f_low   <- ref_f_ranges[[best_ref_idx]]$f_low
+    f_high  <- ref_f_ranges[[best_ref_idx]]$f_high
 
-    is_positive <- mean_energy >= energy_thresh
-
-    # 양성/음성 각각 max_samples개까지만
-    if (is_positive && n_pos >= max_samples) next
-    if (!is_positive && n_neg >= max_samples) next
-
-    # 5가지 지표 계산
     scores <- tryCatch({
       s <- list()
-      # B1: compute_mfcc_similarity 이중 호출 제거 — 결과 재사용
       mfcc_cos <- compute_mfcc_similarity(ref_seg, seg)
-      s$cor_score  <- mfcc_cos  # corMatch 대체로 재사용
-      # B4: DTW-only MFCC (colMeans 코사인 제거)
+      s$cor_score  <- mfcc_cos
       s$mfcc_score <- compute_mfcc_dtw_similarity(ref_seg, seg)
       s$dtw_freq   <- compute_freq_contour_dtw(ref_seg, seg, f_low, f_high)
       s$dtw_env    <- compute_envelope_dtw(ref_seg, seg)
       s$band_energy <- compute_band_energy_ratio(seg, f_low, f_high)
-      # C1: 조화 비율
       s$harmonic_ratio <- compute_harmonic_ratio(seg, f_low, f_high)
       s
     }, error = function(e) NULL)
@@ -778,28 +842,24 @@ auto_tune_weights <- function(wav, t_start, t_end, f_low, f_high) {
     }
   }
 
-  log_info(sprintf("  수집 완료: 양성 %d건, 음성 %d건", n_pos, n_neg))
+  log_info(sprintf("  수집 완료: 양성 %d건, 음성 %d건 (유사도 임계값 %.3f)",
+                    n_pos, n_neg, sim_threshold))
 
   if (n_pos < 1 || n_neg < 1) {
     log_info("  ⚠ 샘플 부족 → 기본 가중치 사용")
-    # 추가 진단: 에너지 분포 요약 출력
-    log_info(sprintf("  [진단] 윈도우 에너지 통계: min=%.6f, median=%.6f, max=%.6f, 70th=%.6f",
-                      min(window_mean_energies), median(window_mean_energies),
-                      max(window_mean_energies), energy_thresh))
-    n_above <- sum(window_mean_energies >= energy_thresh)
-    log_info(sprintf("  [진단] 임계값 이상 윈도우: %d/%d개", n_above, n_windows))
-    if (n_above == 0) {
-      log_info("  [진단] 모든 윈도우가 임계값 미만 → 음원 내 에너지 편차가 없거나 주파수 범위가 맞지 않을 수 있습니다.")
+    log_info(sprintf("  [진단] 유사도 임계값: %.3f", sim_threshold))
+    if (length(non_overlap_sims) > 0) {
+      n_above <- sum(non_overlap_sims >= sim_threshold)
+      log_info(sprintf("  [진단] 임계값 이상 윈도우: %d/%d개", n_above, length(non_overlap_sims)))
     }
     return(list(weights = DEFAULT_WEIGHTS, diagnostics = list(
       n_positive = n_pos, n_negative = n_neg,
       message = "샘플 부족으로 자동 튜닝 불가",
-      energy_thresh = energy_thresh,
-      window_energy_range = c(min(window_mean_energies), max(window_mean_energies))
+      sim_threshold = sim_threshold
     )))
   }
 
-  # 4) 각 지표별 변별력(discriminative power) 계산
+  # 6) 각 지표별 변별력(discriminative power) 계산
   metric_names <- c("cor_score", "mfcc_score", "dtw_freq", "dtw_env", "band_energy", "harmonic_ratio")
   disc_power <- numeric(length(metric_names))
   names(disc_power) <- metric_names
@@ -822,8 +882,6 @@ auto_tune_weights <- function(wav, t_start, t_end, f_low, f_high) {
     pos_means[mi] <- pos_mean
     neg_means[mi] <- neg_mean
 
-    # 변별력 = (양성 평균 - 음성 평균) / pooled SD
-    # Fisher의 판별비와 유사한 개념
     pooled_sd <- sqrt((pos_sd^2 + neg_sd^2) / 2)
     if (is.na(pooled_sd) || pooled_sd < 0.001) pooled_sd <- 0.001
 
@@ -836,7 +894,7 @@ auto_tune_weights <- function(wav, t_start, t_end, f_low, f_high) {
                       mn, pos_means[mn], neg_means[mn], disc_power[mn]))
   }
 
-  # 5) 변별력을 가중치로 변환 (정규화)
+  # 7) 변별력을 가중치로 변환 (정규화)
   total_disc <- sum(disc_power)
   if (total_disc < 0.001) {
     log_info("  ⚠ 모든 지표의 변별력이 0 → 기본 가중치 사용")
@@ -844,10 +902,9 @@ auto_tune_weights <- function(wav, t_start, t_end, f_low, f_high) {
   } else {
     raw_weights <- disc_power / total_disc
 
-    # 최소 가중치 보장 (완전히 0이 되지 않도록)
     min_w <- 0.05
     raw_weights <- pmax(raw_weights, min_w)
-    raw_weights <- raw_weights / sum(raw_weights)  # 재정규화
+    raw_weights <- raw_weights / sum(raw_weights)
 
     optimal_weights <- as.list(raw_weights)
     names(optimal_weights) <- metric_names
@@ -866,10 +923,11 @@ auto_tune_weights <- function(wav, t_start, t_end, f_low, f_high) {
     diagnostics = list(
       n_positive = n_pos,
       n_negative = n_neg,
+      n_templates = valid_templates,
       positive_means = as.list(pos_means),
       negative_means = as.list(neg_means),
       discriminative_power = as.list(disc_power),
-      energy_threshold = energy_thresh
+      sim_threshold = sim_threshold
     )
   )
 }
@@ -921,7 +979,7 @@ if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 # ★ 자동 튜닝 모드 (mode == "auto_tune")
 # ============================================================
 if (run_mode == "auto_tune") {
-  log_info("★★★ 자동 튜닝 모드 실행 ★★★")
+  log_info("★★★ 자동 튜닝 모드 실행 (유사도 기반) ★★★")
 
   if (length(species_list) == 0) stop("종 목록이 비어 있습니다.")
 
@@ -948,18 +1006,33 @@ if (run_mode == "auto_tune") {
       next
     }
 
-    # 주파수 범위 검증/보정
-    freq <- validate_and_fix_freq_range(sp_wav, sp$f_low, sp$f_high,
-                                         sp$t_start, sp$t_end)
+    # 템플릿 목록 구성 (새 형식: templates 배열 / 구 형식: 단일 필드)
+    templates_info <- list()
+    if (!is.null(sp$templates) && length(sp$templates) > 0) {
+      for (tmpl in sp$templates) {
+        freq <- validate_and_fix_freq_range(sp_wav, tmpl$f_low, tmpl$f_high,
+                                             tmpl$t_start, tmpl$t_end)
+        templates_info[[length(templates_info) + 1]] <- list(
+          t_start = tmpl$t_start, t_end = tmpl$t_end,
+          f_low = freq$f_low, f_high = freq$f_high
+        )
+      }
+    } else {
+      # 하위 호환: 단일 템플릿
+      freq <- validate_and_fix_freq_range(sp_wav, sp$f_low, sp$f_high,
+                                           sp$t_start, sp$t_end)
+      templates_info[[1]] <- list(
+        t_start = sp$t_start, t_end = sp$t_end,
+        f_low = freq$f_low, f_high = freq$f_high
+      )
+    }
 
     # 자동 튜닝 실행
-    tune_result <- auto_tune_weights(sp_wav, sp$t_start, sp$t_end,
-                                      freq$f_low, freq$f_high)
+    tune_result <- auto_tune_weights(sp_wav, templates_info)
 
     all_results[[sp_name]] <- list(
       weights = tune_result$weights,
-      diagnostics = tune_result$diagnostics,
-      freq_range = list(f_low = freq$f_low, f_high = freq$f_high)
+      diagnostics = tune_result$diagnostics
     )
   }
 
@@ -979,12 +1052,14 @@ if (run_mode == "auto_tune") {
     }
     cat(sprintf("  %s:\n", sp_name))
     if (!is.null(res$diagnostics)) {
-      cat(sprintf("    양성 %d건, 음성 %d건 분석\n",
+      cat(sprintf("    템플릿 %d개, 양성 %d건, 음성 %d건 분석\n",
+                  res$diagnostics$n_templates,
                   res$diagnostics$n_positive, res$diagnostics$n_negative))
     }
     w <- res$weights
-    cat(sprintf("    cor=%.3f  mfcc=%.3f  freq=%.3f  env=%.3f  band=%.3f\n",
-                w$cor_score, w$mfcc_score, w$dtw_freq, w$dtw_env, w$band_energy))
+    cat(sprintf("    cor=%.3f  mfcc=%.3f  freq=%.3f  env=%.3f  band=%.3f  hr=%.3f\n",
+                w$cor_score, w$mfcc_score, w$dtw_freq, w$dtw_env, w$band_energy,
+                w$harmonic_ratio))
   }
 
   cat("\n[DONE]\n")

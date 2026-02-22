@@ -32,18 +32,26 @@ class TemplateSelector:
     RENDER_W = 1200
     RENDER_H = 600
 
-    def __init__(self, parent, wav_path, callback):
+    # 다중 선택 시 색상 팔레트
+    MULTI_COLORS = ["#FF4444", "#44DD44", "#4488FF", "#FFAA00", "#FF44FF", "#44DDDD"]
+
+    def __init__(self, parent, wav_path, callback, multi_select=False):
         """
         parent: 부모 위젯
         wav_path: WAV 파일 경로
-        callback: 선택 완료 시 호출 — callback(t_start, t_end, f_low, f_high)
+        callback: 선택 완료 시 호출
+            multi_select=False: callback(t_start, t_end, f_low, f_high)
+            multi_select=True:  callback([(t_start, t_end, f_low, f_high), ...])
+        multi_select: True이면 여러 구간을 선택 가능
         """
         self.callback = callback
         self.wav_path = wav_path
+        self.multi_select = multi_select
 
         # 창 설정
         self.win = tk.Toplevel(parent)
-        self.win.title(f"📊 구간 선택 — {Path(wav_path).name}")
+        title = "📊 다중 구간 선택" if multi_select else "📊 구간 선택"
+        self.win.title(f"{title} — {Path(wav_path).name}")
         self.win.geometry("1100x650")
         self.win.transient(parent)
         self.win.grab_set()
@@ -75,7 +83,11 @@ class TemplateSelector:
         self._sel_start = None   # (x, y) 픽셀
         self._sel_rect_id = None
         self._sel_info_id = None
-        self._selection = None   # (t0, t1, f0, f1) 최종 선택값
+        self._selection = None   # (t0, t1, f0, f1) 현재 드래그 중 선택값
+
+        # 다중 선택 상태
+        self._selections = []        # [(t0, t1, f0, f1), ...] 확정된 선택 목록
+        self._sel_canvas_ids = []    # [rect_id, ...] 캔버스 항목
 
         self._build_ui()
 
@@ -87,8 +99,10 @@ class TemplateSelector:
         # 상단 정보바
         top = ttk.Frame(self.win)
         top.pack(fill="x", padx=5, pady=3)
-        ttk.Label(top, text="좌클릭 드래그: 구간 선택  |  우클릭 드래그: 이동  |  휠: 확대/축소",
-                  foreground="gray").pack(side="left")
+        hint = "좌클릭 드래그: 구간 선택  |  우클릭 드래그: 이동  |  휠: 확대/축소"
+        if self.multi_select:
+            hint += "  |  여러 구간을 드래그하여 추가"
+        ttk.Label(top, text=hint, foreground="gray").pack(side="left")
         ttk.Button(top, text="↺ 전체 보기", command=self._reset_view).pack(side="right", padx=5)
 
         # 캔버스
@@ -104,6 +118,9 @@ class TemplateSelector:
 
         ttk.Button(bottom, text="✅ 확인 (선택 적용)", command=self._confirm).pack(side="right", padx=5)
         ttk.Button(bottom, text="❌ 취소", command=self.win.destroy).pack(side="right")
+
+        if self.multi_select:
+            ttk.Button(bottom, text="↩ 마지막 취소", command=self._undo_last_selection).pack(side="right", padx=5)
 
         # 하단 상태바
         self.info_var = tk.StringVar()
@@ -251,6 +268,7 @@ class TemplateSelector:
     # ---- 좌클릭 드래그: 구간 선택 ----
     def _on_sel_start(self, event):
         self._sel_start = (event.x, event.y)
+        # 현재 드래그 중 임시 사각형 제거
         if self._sel_rect_id:
             self.canvas.delete(self._sel_rect_id)
             self._sel_rect_id = None
@@ -263,16 +281,17 @@ class TemplateSelector:
             return
         x0, y0 = self._sel_start
         x1, y1 = event.x, event.y
+        color = self._current_sel_color()
         if self._sel_rect_id:
             self.canvas.coords(self._sel_rect_id, x0, y0, x1, y1)
         else:
             self._sel_rect_id = self.canvas.create_rectangle(
                 x0, y0, x1, y1,
-                outline="#FF4444", width=2, dash=(6, 3)
+                outline=color, width=2, dash=(6, 3)
             )
         t0, t1, f0, f1 = self._px_to_range(x0, y0, x1, y1)
         self.sel_label.config(
-            text=f"선택: {t0:.2f}~{t1:.2f}초, {f0:.0f}~{f1:.0f} Hz"
+            text=f"선택 중: {t0:.2f}~{t1:.2f}초, {f0:.0f}~{f1:.0f} Hz"
         )
 
     def _on_sel_end(self, event):
@@ -286,10 +305,48 @@ class TemplateSelector:
             return
 
         t0, t1, f0, f1 = self._px_to_range(x0, y0, x1, y1)
-        self._selection = (t0, t1, f0, f1)
-        self.sel_label.config(
-            text=f"✅ 선택됨: {t0:.2f}~{t1:.2f}초, {f0:.0f}~{f1:.0f} Hz"
-        )
+
+        if self.multi_select:
+            # 다중 선택: 목록에 추가
+            self._selections.append((t0, t1, f0, f1))
+            # 임시 사각형 제거 후 확정 사각형으로 다시 그리기
+            if self._sel_rect_id:
+                self.canvas.delete(self._sel_rect_id)
+                self._sel_rect_id = None
+            self._redraw_all_selections()
+            n = len(self._selections)
+            self.sel_label.config(
+                text=f"✅ {n}개 구간 선택됨 (최소 2개 필요)"
+                     if n < 2 else f"✅ {n}개 구간 선택됨"
+            )
+        else:
+            # 단일 선택: 기존 동작
+            self._selection = (t0, t1, f0, f1)
+            self.sel_label.config(
+                text=f"✅ 선택됨: {t0:.2f}~{t1:.2f}초, {f0:.0f}~{f1:.0f} Hz"
+            )
+
+    def _current_sel_color(self):
+        """현재 선택에 사용할 색상"""
+        if not self.multi_select:
+            return "#FF4444"
+        idx = len(self._selections) % len(self.MULTI_COLORS)
+        return self.MULTI_COLORS[idx]
+
+    def _undo_last_selection(self):
+        """다중 선택 모드: 마지막 선택 취소"""
+        if not self._selections:
+            return
+        self._selections.pop()
+        self._redraw_all_selections()
+        n = len(self._selections)
+        if n == 0:
+            self.sel_label.config(text="선택 영역: (없음)")
+        else:
+            self.sel_label.config(
+                text=f"✅ {n}개 구간 선택됨 (최소 2개 필요)"
+                     if n < 2 else f"✅ {n}개 구간 선택됨"
+            )
 
     def _px_to_range(self, x0, y0, x1, y1):
         """픽셀 좌표를 시간/주파수 범위로 변환"""
@@ -311,6 +368,9 @@ class TemplateSelector:
 
     def _redraw_selection(self):
         """렌더링 후 선택 영역을 다시 그리기"""
+        if self.multi_select:
+            self._redraw_all_selections()
+            return
         if self._sel_rect_id:
             self.canvas.delete(self._sel_rect_id)
             self._sel_rect_id = None
@@ -334,6 +394,36 @@ class TemplateSelector:
             px_left, px_top, px_right, px_bottom,
             outline="#FF4444", width=2, dash=(6, 3)
         )
+
+    def _redraw_all_selections(self):
+        """다중 선택 모드: 모든 확정된 선택 영역을 다시 그리기"""
+        # 기존 캔버스 항목 제거
+        for cid in self._sel_canvas_ids:
+            self.canvas.delete(cid)
+        self._sel_canvas_ids.clear()
+
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
+        view_dt = self.t_end - self.t_start
+        view_df = self.f_high - self.f_low
+        if view_dt <= 0 or view_df <= 0:
+            return
+
+        for i, (t0, t1, f0, f1) in enumerate(self._selections):
+            color = self.MULTI_COLORS[i % len(self.MULTI_COLORS)]
+            px_left = (t0 - self.t_start) / view_dt * cw
+            px_right = (t1 - self.t_start) / view_dt * cw
+            px_top = (1.0 - (f1 - self.f_low) / view_df) * ch
+            px_bottom = (1.0 - (f0 - self.f_low) / view_df) * ch
+            rect_id = self.canvas.create_rectangle(
+                px_left, px_top, px_right, px_bottom,
+                outline=color, width=2
+            )
+            label_id = self.canvas.create_text(
+                px_left + 3, px_top + 2, anchor="nw",
+                text=f"#{i+1}", fill=color, font=("Arial", 10, "bold")
+            )
+            self._sel_canvas_ids.extend([rect_id, label_id])
 
     # ---- 우클릭 드래그: 팬 ----
     def _on_pan_start(self, event):
@@ -430,9 +520,16 @@ class TemplateSelector:
         self._schedule_render(0)
 
     def _confirm(self):
-        if not self._selection:
-            self.sel_label.config(text="⚠ 먼저 영역을 드래그로 선택하세요!")
-            return
-        t0, t1, f0, f1 = self._selection
-        self.callback(t0, t1, f0, f1)
-        self.win.destroy()
+        if self.multi_select:
+            if len(self._selections) < 2:
+                self.sel_label.config(text="⚠ 최소 2개 구간을 선택하세요!")
+                return
+            self.callback(self._selections)
+            self.win.destroy()
+        else:
+            if not self._selection:
+                self.sel_label.config(text="⚠ 먼저 영역을 드래그로 선택하세요!")
+                return
+            t0, t1, f0, f1 = self._selection
+            self.callback(t0, t1, f0, f1)
+            self.win.destroy()
