@@ -3,7 +3,7 @@
 # ============================================================
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog, messagebox
 import threading
 import time
 import os
@@ -191,6 +191,10 @@ class SpectrogramTab:
         # 초기화 버튼
         ttk.Button(toolbar2, text="↺ 초기화", width=8,
                    command=self._reset_color).pack(side="left", padx=(0, 10))
+
+        # R 스펙토그램 내보내기 버튼
+        ttk.Button(toolbar2, text="📄 R 스펙토그램 내보내기",
+                   command=self._export_r_spectrogram).pack(side="right", padx=5)
 
         # 검출 오버레이 토글 (검출 결과가 있을 때만)
         if self._detections:
@@ -1026,3 +1030,115 @@ class SpectrogramTab:
         if self._playhead_id:
             self.canvas.delete(self._playhead_id)
             self._playhead_id = None
+
+    # ---- R 스펙토그램 내보내기 ----
+    def _export_r_spectrogram(self):
+        """R seewave::spectro()로 연구용 스펙토그램 PNG를 내보낸다."""
+        if not self._loaded:
+            messagebox.showwarning("경고", "WAV 파일이 아직 로드되지 않았습니다.")
+            return
+
+        from r_bridge import find_rscript, export_r_spectrogram
+        from ui.spectro_settings_dialog import SpectroSettingsDialog
+
+        rscript = find_rscript()
+        if not rscript:
+            messagebox.showerror("오류",
+                "Rscript를 찾을 수 없습니다.\n\n"
+                "R이 설치되어 있는지 확인하세요.")
+            return
+
+        # R 스크립트 경로
+        import sys
+        if getattr(sys, 'frozen', False):
+            r_script = Path(sys.executable).parent / "new_analysis.R"
+        else:
+            r_script = Path(__file__).parent.parent / "new_analysis.R"
+        if not r_script.exists():
+            messagebox.showerror("오류", f"R 스크립트를 찾을 수 없습니다:\n{r_script}")
+            return
+
+        # 검출 결과
+        has_det = bool(self._detections)
+
+        # 설정 다이얼로그 (현재 뷰 범위 + 오디오 데이터 전달)
+        defaults = {
+            "f_low": int(self.f_low),
+            "f_high": int(self.f_high),
+        }
+        dlg = SpectroSettingsDialog(
+            self.frame, has_detections=has_det, defaults=defaults,
+            wav_data=self.data, sr=self.sr,
+            t_start=self.t_start, t_end=self.t_end,
+        )
+        if dlg.result is None:
+            return  # 취소
+
+        settings = dlg.result
+
+        # 저장 경로 선택
+        wav_stem = Path(self.wav_path).stem
+        default_name = f"{wav_stem}_spectrogram.png"
+        save_path = filedialog.asksaveasfilename(
+            title="R 스펙토그램 저장",
+            defaultextension=".png",
+            initialfile=default_name,
+            filetypes=[("PNG 이미지", "*.png"), ("모든 파일", "*.*")],
+        )
+        if not save_path:
+            return
+
+        # 시간 범위 (미리보기에서 조정된 값)
+        t_start = settings.get("t_start", self.t_start)
+        t_end = settings.get("t_end", self.t_end)
+
+        detections = self._detections if self._detections else None
+
+        self.info_var.set("R 스펙토그램 생성 중...")
+
+        def _worker():
+            try:
+                result_path = export_r_spectrogram(
+                    rscript_path=rscript,
+                    r_script_path=str(r_script),
+                    wav_path=self.wav_path,
+                    output_path=save_path,
+                    t_start=t_start,
+                    t_end=t_end,
+                    f_low=settings["f_low"],
+                    f_high=settings["f_high"],
+                    width=settings["width"],
+                    height=settings["height"],
+                    wl=settings["wl"],
+                    ovlp=settings["ovlp"],
+                    collevels=settings["collevels"],
+                    palette=settings["palette"],
+                    detections=detections,
+                    dB_min=settings["dB_min"],
+                    dB_max=settings["dB_max"],
+                    res=settings["res"],
+                    show_title=settings["show_title"],
+                    show_scale=settings["show_scale"],
+                    show_osc=settings["show_osc"],
+                    show_detections=settings["show_detections"],
+                    det_cex=settings["det_cex"],
+                )
+                self.frame.after(0, lambda: self._on_r_export_done(result_path))
+            except Exception as e:
+                self.frame.after(0, lambda: self._on_r_export_error(str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_r_export_done(self, path):
+        """R 스펙토그램 내보내기 완료"""
+        self.info_var.set(f"✅ R 스펙토그램 저장 완료: {Path(path).name}")
+        result = messagebox.askyesno("완료",
+            f"R 스펙토그램이 저장되었습니다:\n{path}\n\n파일 위치를 열겠습니까?")
+        if result:
+            import subprocess as sp
+            sp.Popen(["explorer", "/select,", str(path)])
+
+    def _on_r_export_error(self, msg):
+        """R 스펙토그램 내보내기 오류"""
+        self.info_var.set("❌ R 스펙토그램 생성 실패")
+        messagebox.showerror("R 스펙토그램 오류", msg)

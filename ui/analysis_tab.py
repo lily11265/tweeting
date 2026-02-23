@@ -109,6 +109,11 @@ class AnalysisTabMixin:
                                       command=self._export_csv, state="disabled")
         self.btn_export.pack(side="left", padx=5)
 
+        self.btn_r_spectro = ttk.Button(frm_bottom, text="📄 R 스펙토그램 저장",
+                                         command=self._export_r_spectrogram_analysis,
+                                         state="disabled")
+        self.btn_r_spectro.pack(side="left", padx=5)
+
         self.progress = ttk.Progressbar(frm_bottom, mode="determinate", length=200)
         self.progress.pack(side="right")
 
@@ -492,57 +497,78 @@ class AnalysisTabMixin:
 
     def _open_multi_template_selector(self, sp_info):
         """다중 구간 선택: 스펙트로그램에서 여러 새소리 구간을 선택하여 템플릿으로 등록"""
-        # 첫 번째 템플릿의 파일 경로 사용
         if not sp_info["templates"]:
             messagebox.showwarning("경고", "먼저 음원 파일을 선택하세요.")
             return
-        first_tmpl = sp_info["templates"][0]
-        file_path = first_tmpl["path"].get().strip()
-        if not file_path or not os.path.isfile(file_path):
+
+        # 모든 템플릿에서 고유 파일 경로 수집
+        seen = set()
+        file_list = []           # [(original_path, display_name), ...]
+        wav_map = {}             # original_path → converted_wav_path
+        tmp_dir = Path(tempfile.mkdtemp(prefix="birdsong_msel_"))
+
+        for tmpl in sp_info["templates"]:
+            fp = tmpl["path"].get().strip()
+            if not fp or not os.path.isfile(fp) or fp in seen:
+                continue
+            seen.add(fp)
+            display_name = os.path.basename(fp)
+            # WAV 변환/sanitize
+            try:
+                wav_path, _log = ensure_wav(fp, tmp_dir)
+            except Exception:
+                wav_path = fp
+            file_list.append((wav_path, display_name))
+            wav_map[wav_path] = fp   # 변환된 경로 → 원본 파일 경로
+
+        if not file_list:
             messagebox.showwarning("파일 없음", "먼저 종 음원 파일을 선택하세요.")
             return
-
-        # WAV 변환/sanitize
-        wav_path = file_path
-        try:
-            tmp_dir = Path(tempfile.mkdtemp(prefix="birdsong_msel_"))
-            wav_path, _log = ensure_wav(file_path, tmp_dir)
-        except Exception:
-            wav_path = file_path
 
         def on_multi_selected(selections):
             """다중 선택 콜백: 선택된 구간들로 템플릿 행 생성"""
             templates = sp_info["templates"]
-            # 첫 번째 선택 → 첫 번째 템플릿에 적용
-            t0, t1, f0, f1 = selections[0]
-            templates[0]["t_start"].set(round(t0, 2))
-            templates[0]["t_end"].set(round(t1, 2))
-            templates[0]["f_low"].set(round(f0, 0))
-            templates[0]["f_high"].set(round(f1, 0))
-            templates[0]["label"].set("call1")
 
-            # 나머지 선택 → 추가 템플릿 행 생성
             # 기존 추가 템플릿 제거 (2번째부터)
             while len(templates) > 1:
                 old = templates.pop()
                 old["frame"].destroy()
 
-            for i, (t0, t1, f0, f1) in enumerate(selections[1:], start=2):
-                from ui.species_form import _create_template_row
-                tmpl_container = templates[0]["frame"].master
-                tmpl = _create_template_row(
-                    tmpl_container, i,
-                    on_template_select=self._open_template_selector,
-                )
-                tmpl["path"].set(file_path)
-                tmpl["t_start"].set(round(t0, 2))
-                tmpl["t_end"].set(round(t1, 2))
-                tmpl["f_low"].set(round(f0, 0))
-                tmpl["f_high"].set(round(f1, 0))
-                tmpl["label"].set(f"call{i}")
-                templates.append(tmpl)
+            for i, sel in enumerate(selections):
+                # 탭 모드(5-tuple) / 단일 모드(4-tuple) 분기
+                if len(sel) == 5:
+                    t0, t1, f0, f1, wav_p = sel
+                    orig_path = wav_map.get(wav_p, wav_p)
+                else:
+                    t0, t1, f0, f1 = sel
+                    orig_path = wav_map.get(file_list[0][0], file_list[0][0])
 
-        _TemplateSelector(self.root, wav_path, on_multi_selected, multi_select=True)
+                if i == 0:
+                    # 첫 번째 선택 → 첫 번째 템플릿에 적용
+                    templates[0]["path"].set(orig_path)
+                    templates[0]["t_start"].set(round(t0, 2))
+                    templates[0]["t_end"].set(round(t1, 2))
+                    templates[0]["f_low"].set(round(f0, 0))
+                    templates[0]["f_high"].set(round(f1, 0))
+                    templates[0]["label"].set("call1")
+                else:
+                    from ui.species_form import _create_template_row
+                    tmpl_container = templates[0]["frame"].master
+                    tmpl = _create_template_row(
+                        tmpl_container, i + 1,
+                        on_template_select=self._open_template_selector,
+                    )
+                    tmpl["path"].set(orig_path)
+                    tmpl["t_start"].set(round(t0, 2))
+                    tmpl["t_end"].set(round(t1, 2))
+                    tmpl["f_low"].set(round(f0, 0))
+                    tmpl["f_high"].set(round(f1, 0))
+                    tmpl["label"].set(f"call{i + 1}")
+                    templates.append(tmpl)
+
+        # 단일 파일이면 기존 방식, 복수 파일이면 탭 모드
+        wav_input = file_list[0][0] if len(file_list) == 1 else file_list
+        _TemplateSelector(self.root, wav_input, on_multi_selected, multi_select=True)
 
     def _remove_species(self):
         if len(self.species_frames) > 1:
@@ -747,6 +773,7 @@ class AnalysisTabMixin:
             self._display_results(csv_path)
             self.btn_spectro.config(state="normal")
             self.btn_export.config(state="normal")
+            self.btn_r_spectro.config(state="normal")
         else:
             self.txt_result.insert("end", "결과 파일이 생성되지 않았습니다.\n")
 
@@ -754,6 +781,117 @@ class AnalysisTabMixin:
         self.progress.stop()
         self.btn_run.config(state="normal")
         messagebox.showerror("오류", msg)
+
+    def _export_r_spectrogram_analysis(self):
+        """분석 결과 + 스펙토그램을 R seewave::spectro()로 PNG로 내보낸다."""
+        config_path = self.output_dir / "config.json"
+        if not config_path.exists():
+            messagebox.showwarning("경고", "먼저 분석을 실행해 주세요.")
+            return
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        main_wav = config.get("main_wav", "")
+        if not main_wav or not os.path.isfile(main_wav):
+            messagebox.showwarning("경고", "분석에 사용된 WAV 파일을 찾을 수 없습니다.")
+            return
+
+        if not self.rscript_path:
+            messagebox.showerror("오류", "Rscript를 찾을 수 없습니다.")
+            return
+
+        # 검출 결과 로드
+        detections = None
+        csv_path = self.output_dir / "results.csv"
+        if csv_path.exists():
+            try:
+                with open(csv_path, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    detections = []
+                    for row in reader:
+                        detections.append({
+                            "species": row.get("species", ""),
+                            "time": float(row.get("time", 0)),
+                            "score": float(row.get("score", 0)),
+                        })
+            except Exception:
+                detections = None
+
+        # 설정 다이얼로그
+        from ui.spectro_settings_dialog import SpectroSettingsDialog
+        has_det = bool(detections)
+        dlg = SpectroSettingsDialog(self.root, has_detections=has_det,
+                                    wav_path=main_wav)
+        if dlg.result is None:
+            return
+        settings = dlg.result
+
+        # 저장 경로 선택
+        wav_stem = Path(main_wav).stem
+        default_name = f"{wav_stem}_R_spectrogram.png"
+        save_path = filedialog.asksaveasfilename(
+            title="R 스펙토그램 저장",
+            defaultextension=".png",
+            initialfile=default_name,
+            filetypes=[("PNG 이미지", "*.png"), ("모든 파일", "*.*")],
+        )
+        if not save_path:
+            return
+
+        self.btn_r_spectro.config(state="disabled")
+        self.txt_result.insert("end", "\nR 스펙토그램 생성 중...\n")
+        self.txt_result.see("end")
+
+        def _worker():
+            try:
+                from r_bridge import export_r_spectrogram
+                result_path = export_r_spectrogram(
+                    rscript_path=self.rscript_path,
+                    r_script_path=str(self.r_script),
+                    wav_path=main_wav,
+                    output_path=save_path,
+                    t_start=settings.get("t_start"),
+                    t_end=settings.get("t_end"),
+                    detections=detections,
+                    f_low=settings["f_low"],
+                    f_high=settings["f_high"],
+                    width=settings["width"],
+                    height=settings["height"],
+                    wl=settings["wl"],
+                    ovlp=settings["ovlp"],
+                    collevels=settings["collevels"],
+                    palette=settings["palette"],
+                    dB_min=settings["dB_min"],
+                    dB_max=settings["dB_max"],
+                    res=settings["res"],
+                    show_title=settings["show_title"],
+                    show_scale=settings["show_scale"],
+                    show_osc=settings["show_osc"],
+                    show_detections=settings["show_detections"],
+                    det_cex=settings["det_cex"],
+                )
+                self.root.after(0, self._on_r_spectro_done, result_path)
+            except Exception as e:
+                self.root.after(0, self._on_r_spectro_error, str(e))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_r_spectro_done(self, path):
+        self.btn_r_spectro.config(state="normal")
+        self.txt_result.insert("end", f"✅ R 스펙토그램 저장 완료: {path}\n")
+        self.txt_result.see("end")
+        result = messagebox.askyesno("완료",
+            f"R 스펙토그램이 저장되었습니다:\n{path}\n\n파일 위치를 열겠습니까?")
+        if result:
+            import subprocess as sp
+            sp.Popen(["explorer", "/select,", str(path)])
+
+    def _on_r_spectro_error(self, msg):
+        self.btn_r_spectro.config(state="normal")
+        self.txt_result.insert("end", f"❌ R 스펙토그램 생성 실패: {msg}\n")
+        self.txt_result.see("end")
+        messagebox.showerror("R 스펙토그램 오류", msg)
 
     # ========================================
     # 결과 표시

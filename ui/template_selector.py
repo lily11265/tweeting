@@ -26,6 +26,50 @@ except ImportError:
 from colormaps import COLORMAPS
 
 
+class _TabState:
+    """탭 하나의 렌더링/선택 상태를 보관하는 내부 클래스."""
+    def __init__(self, wav_path, display_name):
+        self.wav_path = wav_path
+        self.display_name = display_name
+
+        # WAV 데이터
+        self.sr = None
+        self.data = None
+        self.duration = 0
+        self.max_freq = 22050
+        self.loaded = False
+
+        # 뷰 범위
+        self.t_start = 0.0
+        self.t_end = 1.0
+        self.f_low = 0.0
+        self.f_high = 22050
+
+        # 렌더 상태
+        self.rendered_view = None
+        self.render_after_id = None
+        self.rendering = False
+        self.render_gen = 0
+        self.tk_img = None
+
+        # 캔버스 (UI 빌드 시 설정)
+        self.canvas = None
+
+        # 선택 (좌클릭 드래그) 상태 — 단일 선택용
+        self.sel_start = None
+        self.sel_rect_id = None
+        self.sel_info_id = None
+        self.selection = None  # (t0, t1, f0, f1)
+
+        # 다중 선택 상태
+        self.selections = []         # [(t0, t1, f0, f1), ...]
+        self.sel_canvas_ids = []     # [canvas_item_id, ...]
+
+        # 팬 상태
+        self.pan_start = None
+        self.pan_view = None
+
+
 class TemplateSelector:
     """종 음원의 스펙트로그램을 표시하고 드래그로 시간/주파수 구간을 선택."""
 
@@ -38,63 +82,55 @@ class TemplateSelector:
     def __init__(self, parent, wav_path, callback, multi_select=False):
         """
         parent: 부모 위젯
-        wav_path: WAV 파일 경로
+        wav_path: WAV 파일 경로 (str) 또는
+                  [(wav_path, display_name), ...] 리스트 (탭 모드)
         callback: 선택 완료 시 호출
             multi_select=False: callback(t_start, t_end, f_low, f_high)
-            multi_select=True:  callback([(t_start, t_end, f_low, f_high), ...])
+            multi_select=True (단일파일):  callback([(t_start, t_end, f_low, f_high), ...])
+            multi_select=True (탭모드):    callback([(t_start, t_end, f_low, f_high, file_path), ...])
         multi_select: True이면 여러 구간을 선택 가능
         """
         self.callback = callback
-        self.wav_path = wav_path
         self.multi_select = multi_select
+
+        # wav_path를 정규화: 항상 [(path, name), ...] 리스트로
+        if isinstance(wav_path, (str, Path)):
+            self._wav_files = [(str(wav_path), Path(wav_path).name)]
+        elif isinstance(wav_path, (list, tuple)):
+            self._wav_files = [(str(p), n) for p, n in wav_path]
+        else:
+            self._wav_files = [(str(wav_path), str(wav_path))]
+
+        self._tabbed = len(self._wav_files) > 1
+
+        # 탭별 상태 생성
+        self._tabs: list[_TabState] = []
+        for wp, dn in self._wav_files:
+            self._tabs.append(_TabState(wp, dn))
+
+        self._active_tab_idx = 0
 
         # 창 설정
         self.win = tk.Toplevel(parent)
-        title = "📊 다중 구간 선택" if multi_select else "📊 구간 선택"
-        self.win.title(f"{title} — {Path(wav_path).name}")
-        self.win.geometry("1100x650")
+        if self._tabbed:
+            title = "📊 다중 구간 선택 (탭 전환 가능)" if multi_select else "📊 구간 선택"
+        else:
+            title = "📊 다중 구간 선택" if multi_select else "📊 구간 선택"
+            title += f" — {self._wav_files[0][1]}"
+        self.win.title(title)
+        self.win.geometry("1100x700")
         self.win.transient(parent)
         self.win.grab_set()
 
-        # 데이터
-        self.sr = None
-        self.data = None
-        self.duration = 0
-        self.max_freq = 22050
-
-        # 뷰 범위
-        self.t_start = 0.0
-        self.t_end = 1.0
-        self.f_low = 0.0
-        self.f_high = 22050
-
-        # 렌더 상태
-        self._rendered_view = None
-        self._render_after_id = None
-        self._rendering = False
-        self._render_gen = 0
-        self._loaded = False
-
-        # 팬 (우클릭) 상태
-        self._pan_start = None
-        self._pan_view = None
-
-        # 선택 (좌클릭 드래그) 상태
-        self._sel_start = None   # (x, y) 픽셀
-        self._sel_rect_id = None
-        self._sel_info_id = None
-        self._selection = None   # (t0, t1, f0, f1) 현재 드래그 중 선택값
-
-        # 다중 선택 상태
-        self._selections = []        # [(t0, t1, f0, f1), ...] 확정된 선택 목록
-        self._sel_canvas_ids = []    # [rect_id, ...] 캔버스 항목
-
         self._build_ui()
 
-        # 로딩
-        self.info_var.set("WAV 파일 로딩 중...")
-        threading.Thread(target=self._load_wav, daemon=True).start()
+        # 모든 탭의 WAV 로드 시작
+        for tab in self._tabs:
+            threading.Thread(target=self._load_wav, args=(tab,), daemon=True).start()
 
+    # ============================================================
+    # UI 빌드
+    # ============================================================
     def _build_ui(self):
         # 상단 정보바
         top = ttk.Frame(self.win)
@@ -102,12 +138,28 @@ class TemplateSelector:
         hint = "좌클릭 드래그: 구간 선택  |  우클릭 드래그: 이동  |  휠: 확대/축소"
         if self.multi_select:
             hint += "  |  여러 구간을 드래그하여 추가"
+        if self._tabbed:
+            hint += "  |  탭으로 음원 전환"
         ttk.Label(top, text=hint, foreground="gray").pack(side="left")
         ttk.Button(top, text="↺ 전체 보기", command=self._reset_view).pack(side="right", padx=5)
 
-        # 캔버스
-        self.canvas = tk.Canvas(self.win, bg="black", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True, padx=5, pady=2)
+        # 탭 모드: Notebook  /  단일 모드: Canvas 직접
+        if self._tabbed:
+            self.notebook = ttk.Notebook(self.win)
+            self.notebook.pack(fill="both", expand=True, padx=5, pady=2)
+            for i, tab in enumerate(self._tabs):
+                frame = ttk.Frame(self.notebook)
+                self.notebook.add(frame, text=f" {tab.display_name} ")
+                canvas = tk.Canvas(frame, bg="black", highlightthickness=0)
+                canvas.pack(fill="both", expand=True)
+                tab.canvas = canvas
+                self._bind_canvas_events(canvas, i)
+            self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        else:
+            tab = self._tabs[0]
+            tab.canvas = tk.Canvas(self.win, bg="black", highlightthickness=0)
+            tab.canvas.pack(fill="both", expand=True, padx=5, pady=2)
+            self._bind_canvas_events(tab.canvas, 0)
 
         # 선택 정보 + 버튼 바
         bottom = ttk.Frame(self.win)
@@ -123,25 +175,47 @@ class TemplateSelector:
             ttk.Button(bottom, text="↩ 마지막 취소", command=self._undo_last_selection).pack(side="right", padx=5)
 
         # 하단 상태바
-        self.info_var = tk.StringVar()
+        self.info_var = tk.StringVar(value="WAV 파일 로딩 중...")
         ttk.Label(self.win, textvariable=self.info_var, foreground="gray",
                   font=("Consolas", 9)).pack(fill="x", padx=5, pady=(0, 3))
 
-        # 이벤트 바인딩
-        self.canvas.bind("<ButtonPress-1>", self._on_sel_start)
-        self.canvas.bind("<B1-Motion>", self._on_sel_move)
-        self.canvas.bind("<ButtonRelease-1>", self._on_sel_end)
-        self.canvas.bind("<ButtonPress-3>", self._on_pan_start)
-        self.canvas.bind("<B3-Motion>", self._on_pan_move)
-        self.canvas.bind("<MouseWheel>", self._on_wheel)
-        self.canvas.bind("<Button-4>", self._on_wheel)
-        self.canvas.bind("<Button-5>", self._on_wheel)
-        self.canvas.bind("<Configure>", lambda e: self._schedule_render(100))
+    def _bind_canvas_events(self, canvas, tab_idx):
+        """캔버스에 마우스 이벤트를 바인딩 (탭 인덱스 캡처)."""
+        canvas.bind("<ButtonPress-1>", lambda e, ti=tab_idx: self._on_sel_start(e, ti))
+        canvas.bind("<B1-Motion>", lambda e, ti=tab_idx: self._on_sel_move(e, ti))
+        canvas.bind("<ButtonRelease-1>", lambda e, ti=tab_idx: self._on_sel_end(e, ti))
+        canvas.bind("<ButtonPress-3>", lambda e, ti=tab_idx: self._on_pan_start(e, ti))
+        canvas.bind("<B3-Motion>", lambda e, ti=tab_idx: self._on_pan_move(e, ti))
+        canvas.bind("<MouseWheel>", lambda e, ti=tab_idx: self._on_wheel(e, ti))
+        canvas.bind("<Button-4>", lambda e, ti=tab_idx: self._on_wheel(e, ti))
+        canvas.bind("<Button-5>", lambda e, ti=tab_idx: self._on_wheel(e, ti))
+        canvas.bind("<Configure>", lambda e, ti=tab_idx: self._schedule_render(ti, 100))
 
-    def _load_wav(self):
+    # ============================================================
+    # 탭 전환
+    # ============================================================
+    def _on_tab_changed(self, event=None):
+        if not self._tabbed:
+            return
+        idx = self.notebook.index(self.notebook.select())
+        self._active_tab_idx = idx
+        tab = self._tabs[idx]
+        if tab.loaded:
+            self.info_var.set(
+                f"[{tab.display_name}] {tab.duration:.1f}초, {tab.sr}Hz"
+            )
+            self._schedule_render(idx, 0)
+        else:
+            self.info_var.set(f"[{tab.display_name}] 로딩 중...")
+        self._update_sel_label()
+
+    # ============================================================
+    # WAV 로딩
+    # ============================================================
+    def _load_wav(self, tab: _TabState):
         try:
             from scipy.io import wavfile
-            sr, data = wavfile.read(self.wav_path)
+            sr, data = wavfile.read(tab.wav_path)
             if data.ndim > 1:
                 data = data.mean(axis=1)
             if data.dtype != np.float64:
@@ -149,55 +223,67 @@ class TemplateSelector:
                     data = data.astype(np.float64) / np.iinfo(data.dtype).max
                 else:
                     data = data.astype(np.float64)
-            self.sr = sr
-            self.data = data
-            self.duration = len(data) / sr
-            self.max_freq = sr // 2
-            self.t_start = 0.0
-            self.t_end = self.duration
-            self.f_low = 0.0
-            self.f_high = self.max_freq
-            self._loaded = True
-            self.win.after(0, self._on_loaded)
+            tab.sr = sr
+            tab.data = data
+            tab.duration = len(data) / sr
+            tab.max_freq = sr // 2
+            tab.t_start = 0.0
+            tab.t_end = tab.duration
+            tab.f_low = 0.0
+            tab.f_high = tab.max_freq
+            tab.loaded = True
+            tab_idx = self._tabs.index(tab)
+            self.win.after(0, self._on_loaded, tab_idx)
         except Exception as e:
             self.win.after(0, lambda: self.info_var.set(f"로드 오류: {e}"))
 
-    def _on_loaded(self):
-        self.info_var.set(f"로드 완료: {self.duration:.1f}초, {self.sr}Hz")
-        self._schedule_render(0)
+    def _on_loaded(self, tab_idx):
+        tab = self._tabs[tab_idx]
+        if tab_idx == self._active_tab_idx:
+            self.info_var.set(f"[{tab.display_name}] 로드 완료: {tab.duration:.1f}초, {tab.sr}Hz")
+        self._schedule_render(tab_idx, 0)
 
-    # ---- 렌더링 ----
-    def _schedule_render(self, delay_ms=200):
-        if self._render_after_id:
-            self.canvas.after_cancel(self._render_after_id)
-        self._render_after_id = self.canvas.after(delay_ms, self._render)
+    # ============================================================
+    # 렌더링
+    # ============================================================
+    def _schedule_render(self, tab_idx, delay_ms=200):
+        tab = self._tabs[tab_idx]
+        if tab.render_after_id:
+            tab.canvas.after_cancel(tab.render_after_id)
+        tab.render_after_id = tab.canvas.after(
+            delay_ms, lambda: self._render(tab_idx)
+        )
 
-    def _render(self):
-        if not self._loaded or self._rendering:
+    def _render(self, tab_idx):
+        tab = self._tabs[tab_idx]
+        if not tab.loaded or tab.rendering:
             return
-        self._rendering = True
-        self._render_gen += 1
-        cw = max(self.canvas.winfo_width(), 100)
-        ch = max(self.canvas.winfo_height(), 100)
+        tab.rendering = True
+        tab.render_gen += 1
+        cw = max(tab.canvas.winfo_width(), 100)
+        ch = max(tab.canvas.winfo_height(), 100)
         params = {
-            "t_start": self.t_start, "t_end": self.t_end,
-            "f_low": self.f_low, "f_high": self.f_high,
+            "t_start": tab.t_start, "t_end": tab.t_end,
+            "f_low": tab.f_low, "f_high": tab.f_high,
             "cw": min(cw, self.RENDER_W), "ch": min(ch, self.RENDER_H),
-            "gen": self._render_gen,
+            "gen": tab.render_gen,
         }
-        threading.Thread(target=self._render_worker, args=(params,), daemon=True).start()
+        threading.Thread(
+            target=self._render_worker, args=(tab_idx, params), daemon=True
+        ).start()
 
-    def _render_worker(self, params):
+    def _render_worker(self, tab_idx, params):
+        tab = self._tabs[tab_idx]
         try:
             t_start, t_end = params["t_start"], params["t_end"]
             f_low, f_high = params["f_low"], params["f_high"]
             cw, ch, gen = params["cw"], params["ch"], params["gen"]
 
-            i_start = max(0, int(t_start * self.sr))
-            i_end = min(len(self.data), int(t_end * self.sr))
-            segment = self.data[i_start:i_end]
+            i_start = max(0, int(t_start * tab.sr))
+            i_end = min(len(tab.data), int(t_end * tab.sr))
+            segment = tab.data[i_start:i_end]
             if len(segment) < 64:
-                self.win.after(0, self._on_render_done, None, None, gen)
+                self.win.after(0, self._on_render_done, tab_idx, None, None, gen)
                 return
 
             max_samples = cw * 512
@@ -206,14 +292,14 @@ class TemplateSelector:
                 step = len(segment) // max_samples
                 if step >= 2:
                     segment = _decimate(segment, step)
-                    effective_sr = self.sr / step
+                    effective_sr = tab.sr / step
                 else:
-                    effective_sr = self.sr
+                    effective_sr = tab.sr
             else:
-                effective_sr = self.sr
+                effective_sr = tab.sr
 
             view_duration = t_end - t_start
-            total_ratio = self.duration / max(view_duration, 0.001)
+            total_ratio = tab.duration / max(view_duration, 0.001)
             if total_ratio > 20:
                 nperseg = min(2048, len(segment))
             elif total_ratio > 5:
@@ -229,7 +315,7 @@ class TemplateSelector:
             f_mask = (freqs >= f_low) & (freqs <= f_high)
             Sxx = Sxx[f_mask, :]
             if Sxx.size == 0:
-                self.win.after(0, self._on_render_done, None, None, gen)
+                self.win.after(0, self._on_render_done, tab_idx, None, None, gen)
                 return
 
             Sxx_db = 10 * np.log10(Sxx + 1e-12)
@@ -248,288 +334,353 @@ class TemplateSelector:
             pil_img = pil_img.resize((cw, ch), resample)
 
             info = f"시간: {t_start:.2f}~{t_end:.2f}s  |  주파수: {f_low:.0f}~{f_high:.0f}Hz"
-            self.win.after(0, self._on_render_done, pil_img, info, gen)
+            self.win.after(0, self._on_render_done, tab_idx, pil_img, info, gen)
         except Exception as e:
-            self.win.after(0, self._on_render_done, None, f"렌더링 오류: {e}", gen)
+            self.win.after(0, self._on_render_done, tab_idx, None, f"렌더링 오류: {e}", gen)
 
-    def _on_render_done(self, pil_img, info, gen):
-        self._rendering = False
-        if gen != self._render_gen:
+    def _on_render_done(self, tab_idx, pil_img, info, gen):
+        tab = self._tabs[tab_idx]
+        tab.rendering = False
+        if gen != tab.render_gen:
             return
         if pil_img:
-            self._tk_img = ImageTk.PhotoImage(pil_img)
-            self.canvas.delete("specimg")
-            self.canvas.create_image(0, 0, anchor="nw", image=self._tk_img, tags="specimg")
-            self._rendered_view = (self.t_start, self.t_end, self.f_low, self.f_high)
-            self._redraw_selection()
-        if isinstance(info, str):
-            self.info_var.set(info)
+            tab.tk_img = ImageTk.PhotoImage(pil_img)
+            tab.canvas.delete("specimg")
+            tab.canvas.create_image(0, 0, anchor="nw", image=tab.tk_img, tags="specimg")
+            tab.rendered_view = (tab.t_start, tab.t_end, tab.f_low, tab.f_high)
+            self._redraw_selection(tab_idx)
+        if isinstance(info, str) and tab_idx == self._active_tab_idx:
+            prefix = f"[{tab.display_name}] " if self._tabbed else ""
+            self.info_var.set(prefix + info)
 
-    # ---- 좌클릭 드래그: 구간 선택 ----
-    def _on_sel_start(self, event):
-        self._sel_start = (event.x, event.y)
-        # 현재 드래그 중 임시 사각형 제거
-        if self._sel_rect_id:
-            self.canvas.delete(self._sel_rect_id)
-            self._sel_rect_id = None
-        if self._sel_info_id:
-            self.canvas.delete(self._sel_info_id)
-            self._sel_info_id = None
+    # ============================================================
+    # 좌클릭 드래그: 구간 선택
+    # ============================================================
+    def _on_sel_start(self, event, tab_idx):
+        tab = self._tabs[tab_idx]
+        tab.sel_start = (event.x, event.y)
+        if tab.sel_rect_id:
+            tab.canvas.delete(tab.sel_rect_id)
+            tab.sel_rect_id = None
+        if tab.sel_info_id:
+            tab.canvas.delete(tab.sel_info_id)
+            tab.sel_info_id = None
 
-    def _on_sel_move(self, event):
-        if not self._sel_start or not self._loaded:
+    def _on_sel_move(self, event, tab_idx):
+        tab = self._tabs[tab_idx]
+        if not tab.sel_start or not tab.loaded:
             return
-        x0, y0 = self._sel_start
+        x0, y0 = tab.sel_start
         x1, y1 = event.x, event.y
-        color = self._current_sel_color()
-        if self._sel_rect_id:
-            self.canvas.coords(self._sel_rect_id, x0, y0, x1, y1)
+        color = self._current_sel_color(tab_idx)
+        if tab.sel_rect_id:
+            tab.canvas.coords(tab.sel_rect_id, x0, y0, x1, y1)
         else:
-            self._sel_rect_id = self.canvas.create_rectangle(
+            tab.sel_rect_id = tab.canvas.create_rectangle(
                 x0, y0, x1, y1,
                 outline=color, width=2, dash=(6, 3)
             )
-        t0, t1, f0, f1 = self._px_to_range(x0, y0, x1, y1)
+        t0, t1, f0, f1 = self._px_to_range(tab_idx, x0, y0, x1, y1)
         self.sel_label.config(
             text=f"선택 중: {t0:.2f}~{t1:.2f}초, {f0:.0f}~{f1:.0f} Hz"
         )
 
-    def _on_sel_end(self, event):
-        if not self._sel_start or not self._loaded:
+    def _on_sel_end(self, event, tab_idx):
+        tab = self._tabs[tab_idx]
+        if not tab.sel_start or not tab.loaded:
             return
-        x0, y0 = self._sel_start
+        x0, y0 = tab.sel_start
         x1, y1 = event.x, event.y
-        self._sel_start = None
+        tab.sel_start = None
 
         if abs(x1 - x0) < 5 or abs(y1 - y0) < 5:
             return
 
-        t0, t1, f0, f1 = self._px_to_range(x0, y0, x1, y1)
+        t0, t1, f0, f1 = self._px_to_range(tab_idx, x0, y0, x1, y1)
 
         if self.multi_select:
-            # 다중 선택: 목록에 추가
-            self._selections.append((t0, t1, f0, f1))
-            # 임시 사각형 제거 후 확정 사각형으로 다시 그리기
-            if self._sel_rect_id:
-                self.canvas.delete(self._sel_rect_id)
-                self._sel_rect_id = None
-            self._redraw_all_selections()
-            n = len(self._selections)
-            self.sel_label.config(
-                text=f"✅ {n}개 구간 선택됨 (최소 2개 필요)"
-                     if n < 2 else f"✅ {n}개 구간 선택됨"
-            )
+            tab.selections.append((t0, t1, f0, f1))
+            if tab.sel_rect_id:
+                tab.canvas.delete(tab.sel_rect_id)
+                tab.sel_rect_id = None
+            self._redraw_all_selections(tab_idx)
+            self._update_sel_label()
         else:
-            # 단일 선택: 기존 동작
-            self._selection = (t0, t1, f0, f1)
+            tab.selection = (t0, t1, f0, f1)
             self.sel_label.config(
                 text=f"✅ 선택됨: {t0:.2f}~{t1:.2f}초, {f0:.0f}~{f1:.0f} Hz"
             )
 
-    def _current_sel_color(self):
+    def _current_sel_color(self, tab_idx):
         """현재 선택에 사용할 색상"""
         if not self.multi_select:
             return "#FF4444"
-        idx = len(self._selections) % len(self.MULTI_COLORS)
-        return self.MULTI_COLORS[idx]
+        # 전체 선택 수 기준으로 색상 순환
+        total = self._total_selection_count()
+        return self.MULTI_COLORS[total % len(self.MULTI_COLORS)]
 
-    def _undo_last_selection(self):
-        """다중 선택 모드: 마지막 선택 취소"""
-        if not self._selections:
-            return
-        self._selections.pop()
-        self._redraw_all_selections()
-        n = len(self._selections)
+    def _total_selection_count(self):
+        """모든 탭의 총 선택 수"""
+        return sum(len(t.selections) for t in self._tabs)
+
+    def _update_sel_label(self):
+        """선택 수 라벨 갱신"""
+        n = self._total_selection_count()
         if n == 0:
             self.sel_label.config(text="선택 영역: (없음)")
+        elif n < 2:
+            self.sel_label.config(text=f"✅ {n}개 구간 선택됨 (최소 2개 필요)")
         else:
-            self.sel_label.config(
-                text=f"✅ {n}개 구간 선택됨 (최소 2개 필요)"
-                     if n < 2 else f"✅ {n}개 구간 선택됨"
-            )
+            tab_info = ""
+            if self._tabbed:
+                parts = []
+                for tab in self._tabs:
+                    if tab.selections:
+                        parts.append(f"{tab.display_name}: {len(tab.selections)}개")
+                tab_info = f"  ({', '.join(parts)})"
+            self.sel_label.config(text=f"✅ {n}개 구간 선택됨{tab_info}")
 
-    def _px_to_range(self, x0, y0, x1, y1):
+    def _undo_last_selection(self):
+        """다중 선택 모드: 현재 활성 탭에서 마지막 선택 취소"""
+        tab = self._tabs[self._active_tab_idx]
+        if not tab.selections:
+            # 현재 탭에 선택이 없으면 다른 탭에서 찾기
+            for t in reversed(self._tabs):
+                if t.selections:
+                    tab = t
+                    break
+            else:
+                return
+        tab.selections.pop()
+        tab_idx = self._tabs.index(tab)
+        self._redraw_all_selections(tab_idx)
+        self._update_sel_label()
+
+    # ============================================================
+    # 좌표 변환
+    # ============================================================
+    def _px_to_range(self, tab_idx, x0, y0, x1, y1):
         """픽셀 좌표를 시간/주파수 범위로 변환"""
-        cw = max(self.canvas.winfo_width(), 1)
-        ch = max(self.canvas.winfo_height(), 1)
+        tab = self._tabs[tab_idx]
+        cw = max(tab.canvas.winfo_width(), 1)
+        ch = max(tab.canvas.winfo_height(), 1)
         px_left, px_right = min(x0, x1), max(x0, x1)
         px_top, px_bottom = min(y0, y1), max(y0, y1)
-        view_dt = self.t_end - self.t_start
-        t0 = self.t_start + (px_left / cw) * view_dt
-        t1 = self.t_start + (px_right / cw) * view_dt
-        view_df = self.f_high - self.f_low
-        f1 = self.f_high - (px_top / ch) * view_df
-        f0 = self.f_high - (px_bottom / ch) * view_df
-        t0 = max(0, min(t0, self.duration))
-        t1 = max(0, min(t1, self.duration))
+        view_dt = tab.t_end - tab.t_start
+        t0 = tab.t_start + (px_left / cw) * view_dt
+        t1 = tab.t_start + (px_right / cw) * view_dt
+        view_df = tab.f_high - tab.f_low
+        f1 = tab.f_high - (px_top / ch) * view_df
+        f0 = tab.f_high - (px_bottom / ch) * view_df
+        t0 = max(0, min(t0, tab.duration))
+        t1 = max(0, min(t1, tab.duration))
         f0 = max(0, f0)
-        f1 = min(self.max_freq, f1)
+        f1 = min(tab.max_freq, f1)
         return t0, t1, f0, f1
 
-    def _redraw_selection(self):
+    # ============================================================
+    # 선택 영역 다시 그리기
+    # ============================================================
+    def _redraw_selection(self, tab_idx):
         """렌더링 후 선택 영역을 다시 그리기"""
         if self.multi_select:
-            self._redraw_all_selections()
+            self._redraw_all_selections(tab_idx)
             return
-        if self._sel_rect_id:
-            self.canvas.delete(self._sel_rect_id)
-            self._sel_rect_id = None
-        if self._sel_info_id:
-            self.canvas.delete(self._sel_info_id)
-            self._sel_info_id = None
-        if not self._selection:
+        tab = self._tabs[tab_idx]
+        if tab.sel_rect_id:
+            tab.canvas.delete(tab.sel_rect_id)
+            tab.sel_rect_id = None
+        if tab.sel_info_id:
+            tab.canvas.delete(tab.sel_info_id)
+            tab.sel_info_id = None
+        if not tab.selection:
             return
-        t0, t1, f0, f1 = self._selection
-        cw = max(self.canvas.winfo_width(), 1)
-        ch = max(self.canvas.winfo_height(), 1)
-        view_dt = self.t_end - self.t_start
-        view_df = self.f_high - self.f_low
+        t0, t1, f0, f1 = tab.selection
+        cw = max(tab.canvas.winfo_width(), 1)
+        ch = max(tab.canvas.winfo_height(), 1)
+        view_dt = tab.t_end - tab.t_start
+        view_df = tab.f_high - tab.f_low
         if view_dt <= 0 or view_df <= 0:
             return
-        px_left = (t0 - self.t_start) / view_dt * cw
-        px_right = (t1 - self.t_start) / view_dt * cw
-        px_top = (1.0 - (f1 - self.f_low) / view_df) * ch
-        px_bottom = (1.0 - (f0 - self.f_low) / view_df) * ch
-        self._sel_rect_id = self.canvas.create_rectangle(
+        px_left = (t0 - tab.t_start) / view_dt * cw
+        px_right = (t1 - tab.t_start) / view_dt * cw
+        px_top = (1.0 - (f1 - tab.f_low) / view_df) * ch
+        px_bottom = (1.0 - (f0 - tab.f_low) / view_df) * ch
+        tab.sel_rect_id = tab.canvas.create_rectangle(
             px_left, px_top, px_right, px_bottom,
             outline="#FF4444", width=2, dash=(6, 3)
         )
 
-    def _redraw_all_selections(self):
-        """다중 선택 모드: 모든 확정된 선택 영역을 다시 그리기"""
-        # 기존 캔버스 항목 제거
-        for cid in self._sel_canvas_ids:
-            self.canvas.delete(cid)
-        self._sel_canvas_ids.clear()
+    def _redraw_all_selections(self, tab_idx):
+        """다중 선택 모드: 해당 탭의 모든 확정된 선택 영역을 다시 그리기"""
+        tab = self._tabs[tab_idx]
+        for cid in tab.sel_canvas_ids:
+            tab.canvas.delete(cid)
+        tab.sel_canvas_ids.clear()
 
-        cw = max(self.canvas.winfo_width(), 1)
-        ch = max(self.canvas.winfo_height(), 1)
-        view_dt = self.t_end - self.t_start
-        view_df = self.f_high - self.f_low
+        cw = max(tab.canvas.winfo_width(), 1)
+        ch = max(tab.canvas.winfo_height(), 1)
+        view_dt = tab.t_end - tab.t_start
+        view_df = tab.f_high - tab.f_low
         if view_dt <= 0 or view_df <= 0:
             return
 
-        for i, (t0, t1, f0, f1) in enumerate(self._selections):
-            color = self.MULTI_COLORS[i % len(self.MULTI_COLORS)]
-            px_left = (t0 - self.t_start) / view_dt * cw
-            px_right = (t1 - self.t_start) / view_dt * cw
-            px_top = (1.0 - (f1 - self.f_low) / view_df) * ch
-            px_bottom = (1.0 - (f0 - self.f_low) / view_df) * ch
-            rect_id = self.canvas.create_rectangle(
+        # 이 탭 이전 탭들의 선택 수를 계산 (색상 오프셋용)
+        color_offset = sum(len(self._tabs[j].selections) for j in range(tab_idx))
+
+        for i, (t0, t1, f0, f1) in enumerate(tab.selections):
+            color = self.MULTI_COLORS[(color_offset + i) % len(self.MULTI_COLORS)]
+            px_left = (t0 - tab.t_start) / view_dt * cw
+            px_right = (t1 - tab.t_start) / view_dt * cw
+            px_top = (1.0 - (f1 - tab.f_low) / view_df) * ch
+            px_bottom = (1.0 - (f0 - tab.f_low) / view_df) * ch
+            rect_id = tab.canvas.create_rectangle(
                 px_left, px_top, px_right, px_bottom,
                 outline=color, width=2
             )
-            label_id = self.canvas.create_text(
+            global_idx = color_offset + i + 1
+            label_id = tab.canvas.create_text(
                 px_left + 3, px_top + 2, anchor="nw",
-                text=f"#{i+1}", fill=color, font=("Arial", 10, "bold")
+                text=f"#{global_idx}", fill=color, font=("Arial", 10, "bold")
             )
-            self._sel_canvas_ids.extend([rect_id, label_id])
+            tab.sel_canvas_ids.extend([rect_id, label_id])
 
-    # ---- 우클릭 드래그: 팬 ----
-    def _on_pan_start(self, event):
-        self._pan_start = (event.x, event.y)
-        self._pan_view = (self.t_start, self.t_end, self.f_low, self.f_high)
+    # ============================================================
+    # 우클릭 드래그: 팬
+    # ============================================================
+    def _on_pan_start(self, event, tab_idx):
+        tab = self._tabs[tab_idx]
+        tab.pan_start = (event.x, event.y)
+        tab.pan_view = (tab.t_start, tab.t_end, tab.f_low, tab.f_high)
 
-    def _on_pan_move(self, event):
-        if not self._pan_start or not self._loaded:
+    def _on_pan_move(self, event, tab_idx):
+        tab = self._tabs[tab_idx]
+        if not tab.pan_start or not tab.loaded:
             return
-        dx = event.x - self._pan_start[0]
-        dy = event.y - self._pan_start[1]
-        cw = max(self.canvas.winfo_width(), 1)
-        ch = max(self.canvas.winfo_height(), 1)
-        t0, t1, fl, fh = self._pan_view
+        dx = event.x - tab.pan_start[0]
+        dy = event.y - tab.pan_start[1]
+        cw = max(tab.canvas.winfo_width(), 1)
+        ch = max(tab.canvas.winfo_height(), 1)
+        t0, t1, fl, fh = tab.pan_view
         dt = (t1 - t0) * dx / cw
         df = (fh - fl) * dy / ch
-        self.t_start = t0 - dt
-        self.t_end = t1 - dt
-        self.f_low = fl + df
-        self.f_high = fh + df
-        self._clamp_view()
-        self._apply_visual_transform()
-        self._schedule_render(150)
+        tab.t_start = t0 - dt
+        tab.t_end = t1 - dt
+        tab.f_low = fl + df
+        tab.f_high = fh + df
+        self._clamp_view(tab_idx)
+        self._apply_visual_transform(tab_idx)
+        self._schedule_render(tab_idx, 150)
 
-    # ---- 휠: 줌 ----
-    def _on_wheel(self, event):
-        if not self._loaded:
+    # ============================================================
+    # 휠: 줌
+    # ============================================================
+    def _on_wheel(self, event, tab_idx):
+        tab = self._tabs[tab_idx]
+        if not tab.loaded:
             return
         if event.num == 5 or (hasattr(event, 'delta') and event.delta < 0):
             factor = 1.3
         else:
             factor = 0.75
-        cw = max(self.canvas.winfo_width(), 1)
-        ch = max(self.canvas.winfo_height(), 1)
+        cw = max(tab.canvas.winfo_width(), 1)
+        ch = max(tab.canvas.winfo_height(), 1)
         rx = event.x / cw
         ry = 1.0 - event.y / ch
 
-        t_cursor = self.t_start + rx * (self.t_end - self.t_start)
-        f_cursor = self.f_low + ry * (self.f_high - self.f_low)
+        t_cursor = tab.t_start + rx * (tab.t_end - tab.t_start)
+        f_cursor = tab.f_low + ry * (tab.f_high - tab.f_low)
 
-        new_dt = (self.t_end - self.t_start) * factor
-        new_df = (self.f_high - self.f_low) * factor
+        new_dt = (tab.t_end - tab.t_start) * factor
+        new_df = (tab.f_high - tab.f_low) * factor
 
-        self.t_start = t_cursor - rx * new_dt
-        self.t_end = t_cursor + (1 - rx) * new_dt
-        self.f_low = f_cursor - ry * new_df
-        self.f_high = f_cursor + (1 - ry) * new_df
-        self._clamp_view()
-        self._apply_visual_transform()
-        self._schedule_render(100)
+        tab.t_start = t_cursor - rx * new_dt
+        tab.t_end = t_cursor + (1 - rx) * new_dt
+        tab.f_low = f_cursor - ry * new_df
+        tab.f_high = f_cursor + (1 - ry) * new_df
+        self._clamp_view(tab_idx)
+        self._apply_visual_transform(tab_idx)
+        self._schedule_render(tab_idx, 100)
 
-    def _apply_visual_transform(self):
+    def _apply_visual_transform(self, tab_idx):
         """뷰 변경 시 기존 이미지를 즉시 이동/스케일링 (렌더링 완료 전 시각 피드백)"""
-        if not self._rendered_view or not hasattr(self, '_tk_img') or not self._tk_img:
+        tab = self._tabs[tab_idx]
+        if not tab.rendered_view or not tab.tk_img:
             return
-        old_t0, old_t1, old_fl, old_fh = self._rendered_view
-        cw = max(self.canvas.winfo_width(), 1)
-        ch = max(self.canvas.winfo_height(), 1)
-        new_dt = self.t_end - self.t_start
-        new_df = self.f_high - self.f_low
+        old_t0, old_t1, old_fl, old_fh = tab.rendered_view
+        cw = max(tab.canvas.winfo_width(), 1)
+        ch = max(tab.canvas.winfo_height(), 1)
+        new_dt = tab.t_end - tab.t_start
+        new_df = tab.f_high - tab.f_low
         old_dt = old_t1 - old_t0
         old_df = old_fh - old_fl
         if new_dt <= 0 or new_df <= 0 or old_dt <= 0 or old_df <= 0:
             return
-        ox = (old_t0 - self.t_start) / new_dt * cw
-        oy = (self.f_high - old_fh) / new_df * ch
-        items = self.canvas.find_withtag("specimg")
+        ox = (old_t0 - tab.t_start) / new_dt * cw
+        oy = (tab.f_high - old_fh) / new_df * ch
+        items = tab.canvas.find_withtag("specimg")
         if items:
-            self.canvas.coords(items[0], ox, oy)
+            tab.canvas.coords(items[0], ox, oy)
 
-    def _clamp_view(self):
-        if self.t_start < 0:
-            self.t_end -= self.t_start
-            self.t_start = 0
-        if self.t_end > self.duration:
-            self.t_start -= (self.t_end - self.duration)
-            self.t_end = self.duration
-        if self.t_start < 0:
-            self.t_start = 0
-        if self.f_low < 0:
-            self.f_high -= self.f_low
-            self.f_low = 0
-        if self.f_high > self.max_freq:
-            self.f_low -= (self.f_high - self.max_freq)
-            self.f_high = self.max_freq
-        if self.f_low < 0:
-            self.f_low = 0
+    def _clamp_view(self, tab_idx):
+        tab = self._tabs[tab_idx]
+        if tab.t_start < 0:
+            tab.t_end -= tab.t_start
+            tab.t_start = 0
+        if tab.t_end > tab.duration:
+            tab.t_start -= (tab.t_end - tab.duration)
+            tab.t_end = tab.duration
+        if tab.t_start < 0:
+            tab.t_start = 0
+        if tab.f_low < 0:
+            tab.f_high -= tab.f_low
+            tab.f_low = 0
+        if tab.f_high > tab.max_freq:
+            tab.f_low -= (tab.f_high - tab.max_freq)
+            tab.f_high = tab.max_freq
+        if tab.f_low < 0:
+            tab.f_low = 0
 
     def _reset_view(self):
-        self.t_start = 0.0
-        self.t_end = self.duration
-        self.f_low = 0.0
-        self.f_high = self.max_freq
-        self._schedule_render(0)
+        tab = self._tabs[self._active_tab_idx]
+        tab.t_start = 0.0
+        tab.t_end = tab.duration
+        tab.f_low = 0.0
+        tab.f_high = tab.max_freq
+        self._schedule_render(self._active_tab_idx, 0)
 
+    # ============================================================
+    # 확인/취소
+    # ============================================================
     def _confirm(self):
         if self.multi_select:
-            if len(self._selections) < 2:
+            total = self._total_selection_count()
+            if total < 2:
                 self.sel_label.config(text="⚠ 최소 2개 구간을 선택하세요!")
                 return
-            self.callback(self._selections)
+            if self._tabbed:
+                # 탭 모드: 파일 경로 포함 5-tuple
+                all_selections = []
+                for tab in self._tabs:
+                    for (t0, t1, f0, f1) in tab.selections:
+                        all_selections.append((t0, t1, f0, f1, tab.wav_path))
+                self.callback(all_selections)
+            else:
+                # 단일 파일 모드: 기존 4-tuple
+                self.callback(self._tabs[0].selections)
             self.win.destroy()
         else:
-            if not self._selection:
+            tab = self._tabs[self._active_tab_idx]
+            if not tab.selection:
                 self.sel_label.config(text="⚠ 먼저 영역을 드래그로 선택하세요!")
                 return
-            t0, t1, f0, f1 = self._selection
+            t0, t1, f0, f1 = tab.selection
             self.callback(t0, t1, f0, f1)
             self.win.destroy()
+
+    # ============================================================
+    # 하위 호환 속성 (단일 탭 모드에서 외부 접근 시)
+    # ============================================================
+    @property
+    def canvas(self):
+        return self._tabs[self._active_tab_idx].canvas if self._tabs else None

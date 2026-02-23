@@ -40,8 +40,10 @@ def find_rscript():
         # Portable R의 라이브러리 경로도 설정
         r_libs = app_dir / "R-Portable" / "library"
         if r_libs.exists():
-            os.environ["R_LIBS_USER"] = str(r_libs)
-            os.environ["R_LIBS"] = str(r_libs)
+            r_libs_str = str(r_libs)
+            os.environ["R_LIBS_USER"] = r_libs_str
+            os.environ["R_LIBS"] = r_libs_str
+            os.environ["R_LIBS_SITE"] = r_libs_str
         return str(portable)
 
     # 1) PATH에 있으면 바로 사용
@@ -77,3 +79,132 @@ def find_rscript():
                         return str(candidate)
 
     return None  # 찾지 못함
+
+
+def export_r_spectrogram(
+    rscript_path,
+    r_script_path,
+    wav_path,
+    output_path,
+    t_start=None,
+    t_end=None,
+    f_low=None,
+    f_high=None,
+    width=1600,
+    height=800,
+    wl=512,
+    ovlp=75,
+    collevels=30,
+    palette="spectro.colors",
+    detections=None,
+    timeout=300,
+    dB_min=-60,
+    dB_max=0,
+    res=150,
+    show_title=True,
+    show_scale=True,
+    show_osc=False,
+    show_detections=True,
+    det_cex=0.7,
+):
+    """R seewave::spectro()로 연구용 스펙트로그램 PNG를 생성한다.
+
+    Args:
+        rscript_path: Rscript.exe 경로
+        r_script_path: new_analysis.R 경로
+        wav_path: 대상 WAV 파일 경로
+        output_path: 저장할 PNG 파일 경로
+        t_start/t_end: 시간 범위 (초, None이면 전체)
+        f_low/f_high: 주파수 범위 (Hz, None이면 전체)
+        width/height: 이미지 크기 (px)
+        wl: FFT 윈도우 길이
+        ovlp: 오버랩 %
+        collevels: dB 레벨 수
+        palette: 팔레트 이름
+        detections: 검출 결과 [{species, time, score}, ...]
+        timeout: R 실행 제한 시간 (초)
+        dB_min/dB_max: dB 범위 (밝기/대비)
+        res: DPI
+        show_title: 제목 표시
+        show_scale: 스케일바 표시
+        show_osc: 오실로그램 표시
+        show_detections: 검출 오버레이 표시
+        det_cex: 검출 라벨 크기
+
+    Returns:
+        str: 생성된 PNG 파일 경로
+
+    Raises:
+        RuntimeError: R 실행 실패 시
+    """
+    import json
+    import subprocess
+    import tempfile
+
+    config = {
+        "mode": "spectrogram",
+        "wav_path": str(wav_path),
+        "output_path": str(output_path),
+        "output_dir": str(Path(output_path).parent),
+        "width": width,
+        "height": height,
+        "wl": wl,
+        "ovlp": ovlp,
+        "collevels": collevels,
+        "palette": palette,
+        "dB_min": dB_min,
+        "dB_max": dB_max,
+        "res": res,
+        "show_title": show_title,
+        "show_scale": show_scale,
+        "show_osc": show_osc,
+        "show_detections": show_detections,
+        "det_cex": det_cex,
+    }
+
+    if t_start is not None:
+        config["t_start"] = t_start
+    if t_end is not None:
+        config["t_end"] = t_end
+    if f_low is not None:
+        config["f_low"] = f_low
+    if f_high is not None:
+        config["f_high"] = f_high
+    if detections and show_detections:
+        config["detections"] = detections
+
+    # 임시 config JSON 생성
+    config_dir = Path(output_path).parent
+    config_path = config_dir / "_spectro_config.json"
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+    try:
+        result = subprocess.run(
+            [rscript_path, "--encoding=UTF-8", str(r_script_path), str(config_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+
+        if result.returncode != 0:
+            error_msg = result.stderr or result.stdout or "Unknown error"
+            raise RuntimeError(f"R 스펙트로그램 생성 실패:\n{error_msg}")
+
+        if not Path(output_path).exists():
+            raise RuntimeError(
+                f"R 실행은 완료되었으나 출력 파일이 없습니다: {output_path}\n"
+                f"R stdout: {result.stdout}"
+            )
+
+        return str(output_path)
+
+    finally:
+        # 임시 config 삭제
+        try:
+            config_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
