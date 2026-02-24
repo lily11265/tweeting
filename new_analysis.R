@@ -483,19 +483,25 @@ compute_mfcc_similarity <- function(wav_template, wav_segment, numcep = 13) {
       }
 
       # 프레임별 평균 MFCC 벡터로 요약 (전체 특성)
-      mean_t <- colMeans(mfcc_t)
-      mean_s <- colMeans(mfcc_s)
+      mean_t <- colMeans(mfcc_t, na.rm = TRUE)
+      mean_s <- colMeans(mfcc_s, na.rm = TRUE)
+
+      # NaN/NA 보호: melfcc가 NaN을 반환하면 유사도 계산 불가
+      if (any(is.na(mean_t)) || any(is.na(mean_s))) {
+        return(0)
+      }
 
       # 코사인 유사도
       dot_prod <- sum(mean_t * mean_s)
       norm_t <- sqrt(sum(mean_t^2))
       norm_s <- sqrt(sum(mean_s^2))
 
-      if (norm_t == 0 || norm_s == 0) {
+      if (is.na(norm_t) || is.na(norm_s) || norm_t == 0 || norm_s == 0) {
         return(0)
       }
 
       sim <- dot_prod / (norm_t * norm_s)
+      if (is.na(sim)) return(0)
       # -1~1을 0~1로 스케일링
       max(0, (sim + 1) / 2)
     },
@@ -1149,38 +1155,85 @@ auto_tune_weights <- function(wav, templates_info) {
   # ★ 계층적 샘플링: 시간 순서대로가 아닌, 유사도 분포에서 균등 추출
   #    양성은 가장 유사한 것부터, 음성은 가장 비유사한 것부터 추출하되
   #    다양한 유사도 수준을 포함하도록 함
-  pos_indices <- which(window_max_sims >= sim_threshold)
 
-  # ★ 적응형 음성 임계값: 최소 10개 음성을 확보할 때까지 단계적 완화
-  min_neg_required <- 10
-  neg_factor <- 0.7 # 시작: sim_threshold * 0.7
-  neg_indices <- which(window_max_sims < sim_threshold * neg_factor &
-    window_max_sims < 1.0) # sim=1.0 (템플릿 겹침) 제외
+  # ★ 비겹침 윈도우만 분류 대상 (sim=1.0은 확정 양성 — 템플릿 자체)
+  non_template_indices <- which(window_max_sims < 1.0)
 
-  while (length(neg_indices) < min_neg_required && neg_factor < 0.95) {
-    neg_factor <- neg_factor + 0.05
-    neg_indices <- which(window_max_sims < sim_threshold * neg_factor &
-      window_max_sims < 1.0)
+  # 분류 전략 결정: 절대 임계값 vs 상대 분위수
+  # 비겹침 윈도우의 중앙값이 임계값 이상이면 절대 임계값으로는 분리 불가
+  # → 상대 분위수 기반 분류로 전환
+  use_percentile_split <- FALSE
+  if (length(non_template_indices) >= 6) {
+    nt_sims <- window_max_sims[non_template_indices]
+    n_above_threshold <- sum(nt_sims >= sim_threshold)
+    n_below_threshold <- sum(nt_sims < sim_threshold)
+
+    # 음성이 전체의 15% 미만이면 절대 임계값이 부적합
+    if (n_below_threshold < length(non_template_indices) * 0.15) {
+      use_percentile_split <- TRUE
+      log_info(sprintf(
+        "  ⚠ 절대 임계값(%.3f)으로 분리 불가 (이상:%d, 미만:%d) → 분위수 기반 분류",
+        sim_threshold, n_above_threshold, n_below_threshold
+      ))
+    }
   }
 
-  # 여전히 부족하면: 유사도 하위 N개를 강제 음성으로 사용
-  if (length(neg_indices) < min_neg_required) {
-    non_template_indices <- which(window_max_sims < 1.0) # 템플릿 겹침 제외
-    if (length(non_template_indices) >= min_neg_required) {
-      sorted_idx <- non_template_indices[order(window_max_sims[non_template_indices])]
-      neg_indices <- sorted_idx[1:min(max_samples, length(sorted_idx))]
-    } else if (length(non_template_indices) > 0) {
-      neg_indices <- non_template_indices
-    }
+  if (use_percentile_split) {
+    # ★ 분위수 기반 분류: 상위 30% = 양성, 하위 30% = 음성
+    # 중간 40%는 애매한 구간이므로 제외
+    nt_sims <- window_max_sims[non_template_indices]
+    q_high <- quantile(nt_sims, 0.70) # 상위 30% 경계
+    q_low  <- quantile(nt_sims, 0.30) # 하위 30% 경계
+
+    # 템플릿 겹침(sim=1.0)은 확정 양성에 포함
+    pos_indices <- c(
+      which(window_max_sims == 1.0),
+      non_template_indices[nt_sims >= q_high]
+    )
+    neg_indices <- non_template_indices[nt_sims <= q_low]
+
     log_info(sprintf(
-      "  ⚠ 음성 부족 → 유사도 하위 %d개 강제 사용 (factor=%.2f)",
-      length(neg_indices), neg_factor
+      "  분위수 분류: 양성 임계값=%.3f (상위 30%%), 음성 임계값=%.3f (하위 30%%)",
+      q_high, q_low
+    ))
+    log_info(sprintf(
+      "  양성 후보=%d, 음성 후보=%d (총 비겹침=%d)",
+      length(pos_indices), length(neg_indices), length(non_template_indices)
     ))
   } else {
-    log_info(sprintf(
-      "  음성 임계값: sim < %.3f (factor=%.2f, %d건)",
-      sim_threshold * neg_factor, neg_factor, length(neg_indices)
-    ))
+    # 원래 절대 임계값 기반 분류
+    pos_indices <- which(window_max_sims >= sim_threshold)
+
+    # ★ 적응형 음성 임계값: 최소 10개 음성을 확보할 때까지 단계적 완화
+    min_neg_required <- 10
+    neg_factor <- 0.7 # 시작: sim_threshold * 0.7
+    neg_indices <- which(window_max_sims < sim_threshold * neg_factor &
+      window_max_sims < 1.0) # sim=1.0 (템플릿 겹침) 제외
+
+    while (length(neg_indices) < min_neg_required && neg_factor < 0.95) {
+      neg_factor <- neg_factor + 0.05
+      neg_indices <- which(window_max_sims < sim_threshold * neg_factor &
+        window_max_sims < 1.0)
+    }
+
+    # 여전히 부족하면: 유사도 하위 N개를 강제 음성으로 사용
+    if (length(neg_indices) < min_neg_required) {
+      if (length(non_template_indices) >= min_neg_required) {
+        sorted_idx <- non_template_indices[order(window_max_sims[non_template_indices])]
+        neg_indices <- sorted_idx[1:min(max_samples, length(sorted_idx))]
+      } else if (length(non_template_indices) > 0) {
+        neg_indices <- non_template_indices
+      }
+      log_info(sprintf(
+        "  ⚠ 음성 부족 → 유사도 하위 %d개 강제 사용 (factor=%.2f)",
+        length(neg_indices), neg_factor
+      ))
+    } else {
+      log_info(sprintf(
+        "  음성 임계값: sim < %.3f (factor=%.2f, %d건)",
+        sim_threshold * neg_factor, neg_factor, length(neg_indices)
+      ))
+    }
   }
 
   # 유사도 기준 정렬 후 균등 간격 서브샘플링
@@ -1195,15 +1248,21 @@ auto_tune_weights <- function(wav, templates_info) {
     neg_indices <- neg_indices[seq(1, length(neg_indices), by = step_n)][1:min(max_samples, length(neg_indices))]
   }
 
+  # ★ 윈도우 역할 맵: 어떤 인덱스가 양성/음성으로 배정되었는지 추적
+  # 이후 루프에서 재분류하지 않고 이 맵을 사용
+  window_role <- rep("skip", n_windows)
+  window_role[pos_indices] <- "positive"
+  window_role[neg_indices] <- "negative"
+
   sample_indices <- c(pos_indices, neg_indices)
 
   for (wi in sample_indices) {
     w_start <- window_starts[wi]
     w_end <- w_start + window_dur
-    sim <- window_max_sims[wi]
 
-    is_positive <- sim >= sim_threshold
-    is_negative <- sim < sim_threshold * 0.7
+    # ★ 사전 배정된 역할 사용 (재분류하지 않음)
+    is_positive <- window_role[wi] == "positive"
+    is_negative <- window_role[wi] == "negative"
 
     if (!is_positive && !is_negative) next
 
