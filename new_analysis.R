@@ -1038,6 +1038,77 @@ normalize_candidate_scores <- function(df, weights) {
 }
 
 # ============================================================
+# ★ 후보 위치 보정: 대역 에너지 포락선 기반 피크 재정렬
+# corMatch는 부분 매칭으로 울음의 시작/끝에 피크가 생기기 쉬움
+# → 대역 에너지가 최대인 실제 울음 중심으로 이동
+# ============================================================
+
+#' 전체 음원의 대역 에너지 포락선을 한 번만 계산 (O(N))
+#' bandpass filter → 제곱 → 이동 평균 → 시간별 에너지 맵
+#' @param wav 전체 음원 Wave 객체
+#' @param f_low 주파수 하한 (kHz)
+#' @param f_high 주파수 상한 (kHz)
+#' @param window_sec 에너지 계산 윈도우 크기 (초)
+#' @return list(energy, sr) 또는 NULL
+compute_band_energy_envelope <- function(wav, f_low, f_high, window_sec = 0.05) {
+  tryCatch(
+    {
+      sr <- wav@samp.rate
+
+      # 밴드패스 필터링 (전체 음원 1회)
+      bp_from <- f_low * 1000 # kHz → Hz
+      bp_to <- min(f_high * 1000, sr / 2 - 1)
+      if (bp_from >= bp_to || bp_from < 1) return(NULL)
+
+      filtered <- seewave::ffilter(wav,
+        f = sr, from = bp_from, to = bp_to,
+        output = "Wave"
+      )
+
+      # 제곱 신호 → 이동 평균으로 단시간 에너지
+      sig <- as.numeric(filtered@left)^2
+      win_samples <- max(1, round(window_sec * sr))
+      kernel <- rep(1 / win_samples, win_samples)
+      energy <- stats::filter(sig, kernel, sides = 2)
+      energy[is.na(energy)] <- 0
+
+      list(energy = as.numeric(energy), sr = sr)
+    },
+    error = function(e) {
+      log_debug(sprintf("  에너지 포락선 계산 오류: %s", e$message))
+      NULL
+    }
+  )
+}
+
+#' corMatch 피크를 대역 에너지 최대 지점으로 보정
+#' @param energy_env compute_band_energy_envelope() 결과
+#' @param peak_time corMatch 피크 시간 (초)
+#' @param ref_duration 템플릿 길이 (초)
+#' @return 보정된 피크 시간 (초)
+refine_peak_position <- function(energy_env, peak_time, ref_duration) {
+  if (is.null(energy_env)) return(peak_time)
+
+  sr <- energy_env$sr
+  n <- length(energy_env$energy)
+
+  # 탐색 범위: corMatch 피크 기준 ±1 템플릿 길이
+  search_radius_samples <- round(ref_duration * sr)
+  peak_sample <- max(1, round(peak_time * sr))
+
+  s_start <- max(1, peak_sample - search_radius_samples)
+  s_end <- min(n, peak_sample + search_radius_samples)
+
+  if (s_end <= s_start) return(peak_time)
+
+  region <- energy_env$energy[s_start:s_end]
+  best_offset <- which.max(region) - 1
+  refined_time <- (s_start + best_offset) / sr
+
+  refined_time
+}
+
+# ============================================================
 # ★ 자동 튜닝: 종 음원 자가진단으로 최적 가중치 결정
 # ============================================================
 #' 종 음원 내에서 자가진단을 수행하여 최적 가중치를 자동으로 결정한다.
@@ -2366,12 +2437,28 @@ for (t_idx in seq_along(template_names)) {
   # 레퍼런스 길이 (초)
   ref_duration <- if (!is.null(ref_wav)) length(ref_wav@left) / ref_wav@samp.rate else 1.0
 
+  # ★ 대역 에너지 포락선 1회 사전 계산 (피크 위치 보정용)
+  band_env <- compute_band_energy_envelope(
+    main_wav, ref_freq$f_low, ref_freq$f_high,
+    window_sec = min(0.05, ref_duration * 0.1)
+  )
+  if (!is.null(band_env)) {
+    log_info(sprintf("  ★ 대역 에너지 포락선 계산 완료 (피크 보정 활성)"))
+  }
+
   # 각 후보 구간 평가
   sp_results <- vector("list", nrow(det))
+  n_refined <- 0
 
   for (j in seq_len(nrow(det))) {
-    peak_time <- det$time[j]
+    peak_time_orig <- det$time[j]
     cor_score <- det$score[j]
+
+    # ★ 피크 위치 보정: 대역 에너지 최대 지점으로 재정렬
+    peak_time <- refine_peak_position(band_env, peak_time_orig, ref_duration)
+    if (abs(peak_time - peak_time_orig) > ref_duration * 0.1) {
+      n_refined <- n_refined + 1
+    }
 
     # 후보 구간 추출
     margin <- ref_duration * 0.2
@@ -2458,6 +2545,10 @@ for (t_idx in seq_along(template_names)) {
         composite
       ))
     }
+  }
+
+  if (n_refined > 0) {
+    log_info(sprintf("  ★ 피크 보정: %d/%d건 위치 재조정 (대역 에너지 기반)", n_refined, nrow(det)))
   }
 
   # 결합
