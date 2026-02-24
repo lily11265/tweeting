@@ -73,12 +73,13 @@ class AnalysisTabMixin:
 
         self.weight_vars = {}
         weight_defs = [
-            ("cor_score",      "스펙트로그램 상관", 0.20),
-            ("mfcc_score",     "MFCC 유사도",      0.20),
-            ("dtw_freq",       "주파수궤적 DTW",   0.15),
-            ("dtw_env",        "진폭포락선 DTW",   0.10),
-            ("band_energy",    "대역 에너지",      0.15),
-            ("harmonic_ratio", "조화 비율",        0.20),
+            ("cor_score",      "스펙트로그램 상관", 0.18),
+            ("mfcc_score",     "MFCC 유사도",      0.18),
+            ("dtw_freq",       "주파수궤적 DTW",   0.13),
+            ("dtw_env",        "진폭포락선 DTW",   0.08),
+            ("band_energy",    "대역 에너지",      0.13),
+            ("harmonic_ratio", "조화 비율",        0.18),
+            ("snr",            "신호대잡음비",     0.12),
         ]
         wrow = ttk.Frame(frm_weights)
         wrow.pack(fill="x")
@@ -349,10 +350,12 @@ class AnalysisTabMixin:
                   "dtw_freq": "주파수궤적DTW",
                   "dtw_env": "진폭포락선DTW",
                   "band_energy": "대역에너지",
-                  "harmonic_ratio": "조화비율"}
-        defaults = {"cor_score": 0.20, "mfcc_score": 0.20,
-                    "dtw_freq": 0.15, "dtw_env": 0.10,
-                    "band_energy": 0.15, "harmonic_ratio": 0.20}
+                  "harmonic_ratio": "조화비율",
+                  "snr": "신호대잡음비"}
+        defaults = {"cor_score": 0.18, "mfcc_score": 0.18,
+                    "dtw_freq": 0.13, "dtw_env": 0.08,
+                    "band_energy": 0.13, "harmonic_ratio": 0.18,
+                    "snr": 0.12}
 
         for sp_name, res in tune_results.items():
             self.at_txt_result.insert("end", f"▶ {sp_name}\n")
@@ -382,12 +385,12 @@ class AnalysisTabMixin:
                 f"  {'-'*16}  {'-'*6}  {'-'*6}  {'-'*6}  "
                 f"{'-'*7}  {'-'*7}  {'-'*4}\n")
 
-            for key in ["cor_score", "mfcc_score", "dtw_freq", "dtw_env", "band_energy", "harmonic_ratio"]:
-                tuned = w.get(key, 0)
+            for key in ["cor_score", "mfcc_score", "dtw_freq", "dtw_env", "band_energy", "harmonic_ratio", "snr"]:
+                tuned = float(w.get(key, 0))
                 default = defaults[key]
-                disc = dp.get(key, 0)
-                p_mean = pm.get(key, 0)
-                n_mean = nm_.get(key, 0)
+                disc = float(dp.get(key, 0))
+                p_mean = float(pm.get(key, 0))
+                n_mean = float(nm_.get(key, 0))
                 arrow = "↑↑" if tuned > default + 0.05 else \
                         "↑" if tuned > default + 0.02 else \
                         "↓↓" if tuned < default - 0.05 else \

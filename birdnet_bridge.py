@@ -47,6 +47,7 @@ def main():
     predictions = model.predict(
         wav_path,
         default_confidence_threshold=confidence,
+        n_workers=1,
     )
 
     print(json.dumps({"progress": "결과 변환 중..."}), flush=True)
@@ -107,29 +108,17 @@ def run_birdnet_prediction(
     """
     BirdNET으로 WAV 파일을 분석하여 annotation 형식으로 반환.
     Windows 호환을 위해 서브프로세스에서 실행.
-
-    Args:
-        wav_path: WAV 파일 경로
-        confidence_threshold: 최소 신뢰도 임계값 (기본 0.5)
-        lang: 종명 언어 (기본 "ko" 한국어)
-        progress_callback: 진행 상태 콜백 (메시지 문자열)
-
-    Returns:
-        [{
-            "file": "파일명.wav",
-            "t_start": float,
-            "t_end": float,
-            "f_low": 0,
-            "f_high": 24000,
-            "species": "종명",
-            "confidence": float,
-        }, ...]
     """
     if not HAS_BIRDNET:
         raise RuntimeError(
             "BirdNET이 설치되지 않았습니다.\n"
             "설치: pip install birdnet"
         )
+
+    print(f"[BirdNET] === 시작 ===")
+    print(f"[BirdNET] wav_path: {wav_path}")
+    print(f"[BirdNET] confidence: {confidence_threshold}, lang: {lang}")
+    print(f"[BirdNET] sys.executable: {sys.executable}")
 
     if progress_callback:
         progress_callback("BirdNET 서브프로세스 시작 중...")
@@ -141,6 +130,8 @@ def run_birdnet_prediction(
         "lang": lang,
     }, ensure_ascii=False)
 
+    print(f"[BirdNET] args_json: {args_json}")
+
     # 워커 스크립트를 임시 파일로 저장
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", delete=False, encoding="utf-8"
@@ -148,43 +139,79 @@ def run_birdnet_prediction(
         f.write(_WORKER_SCRIPT)
         worker_path = f.name
 
+    print(f"[BirdNET] worker_path: {worker_path}")
+
+    cmd = [sys.executable, worker_path, args_json]
+    print(f"[BirdNET] cmd: {cmd}")
+
     try:
+        # stderr→stdout 통합: TensorFlow 경고가 stderr 파이프 버퍼를
+        # 가득 채워 데드락을 유발하는 문제를 방지
+        print(f"[BirdNET] Popen 시작...")
         proc = subprocess.Popen(
-            [sys.executable, worker_path, args_json],
+            cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             encoding="utf-8",
             errors="replace",
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
+        print(f"[BirdNET] Popen 완료, PID={proc.pid}")
 
         results = None
+        diag_lines = []  # non-JSON lines for error diagnosis
+        line_count = 0
+        print(f"[BirdNET] stdout 읽기 시작...")
+
         for line in proc.stdout:
             line = line.strip()
             if not line:
                 continue
+            line_count += 1
             try:
                 msg = json.loads(line)
-                if "progress" in msg and progress_callback:
-                    progress_callback(msg["progress"])
+                if "progress" in msg:
+                    print(f"[BirdNET] 진행: {msg['progress']}")
+                    if progress_callback:
+                        progress_callback(msg["progress"])
                 elif "result" in msg:
                     results = msg["result"]
+                    print(f"[BirdNET] 결과 수신: {len(results)}건")
+                else:
+                    print(f"[BirdNET] JSON(기타): {line[:200]}")
             except json.JSONDecodeError:
-                pass
+                diag_lines.append(line)
+                print(f"[BirdNET] 비-JSON: {line[:200]}")
 
-        proc.wait()
+        print(f"[BirdNET] stdout 읽기 완료 (총 {line_count}줄)")
+        print(f"[BirdNET] proc.wait() 호출 중...")
+
+        proc.wait(timeout=600)  # 10-minute timeout
+
+        print(f"[BirdNET] proc.wait() 완료, returncode={proc.returncode}")
 
         if proc.returncode != 0:
-            stderr = proc.stderr.read()
-            raise RuntimeError(f"BirdNET 프로세스 오류 (코드 {proc.returncode}):\n{stderr}")
+            diag = "\n".join(diag_lines[-30:])  # last 30 lines
+            raise RuntimeError(f"BirdNET 프로세스 오류 (코드 {proc.returncode}):\n{diag}")
 
         if results is None:
-            raise RuntimeError("BirdNET에서 결과를 받지 못했습니다.")
+            diag = "\n".join(diag_lines[-30:])
+            raise RuntimeError(f"BirdNET에서 결과를 받지 못했습니다.\n진단 로그:\n{diag}")
 
         if progress_callback:
             progress_callback(f"완료: {len(results)}건 검출")
 
+        print(f"[BirdNET] === 완료: {len(results)}건 ===")
         return results
+
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        print(f"[BirdNET] === 타임아웃 ===")
+        raise RuntimeError("BirdNET 프로세스가 시간 초과(10분)되었습니다.")
+
+    except Exception as e:
+        print(f"[BirdNET] === 예외: {e} ===")
+        raise
 
     finally:
         try:

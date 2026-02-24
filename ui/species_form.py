@@ -174,12 +174,13 @@ def create_species_form(
         ).pack(side="left")
 
         w_defs = [
-            ("cor_score", "corM", 0.20),
-            ("mfcc_score", "MFCC", 0.20),
-            ("dtw_freq", "freq", 0.15),
-            ("dtw_env", "env", 0.10),
-            ("band_energy", "band", 0.15),
-            ("harmonic_ratio", "HR", 0.20),
+            ("cor_score", "corM", 0.18),
+            ("mfcc_score", "MFCC", 0.18),
+            ("dtw_freq", "freq", 0.13),
+            ("dtw_env", "env", 0.08),
+            ("band_energy", "band", 0.13),
+            ("harmonic_ratio", "HR", 0.18),
+            ("snr", "SNR", 0.12),
         ]
         for key, label, default in w_defs:
             ttk.Label(w_frame, text=f"{label}:").pack(side="left", padx=(5, 0))

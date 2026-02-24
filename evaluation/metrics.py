@@ -220,11 +220,12 @@ def compute_curve_metrics(
         # FP가 없으면 전체 후보 최저 score의 절반
         virtual_neg_score = float(min(y_scores) * 0.5) if y_scores else 0.0
 
+    # TP(매칭된) 후보의 시간만 건너뛰기 대상으로 사용
+    # FP 후보 근처는 건너뛸 필요 없음 (FP 자체가 이미 음성)
+    matched_cand_times = [c["time"] for c, y in zip(sp_cands, y_true_cand) if y == 1]
+
     n_virtual = 0
     if audio_duration is not None and audio_duration > 0:
-        # 기존 candidate 시간 목록
-        cand_times = [c["time"] for c in sp_cands]
-
         t = neg_window_step / 2  # 첫 윈도우 중심
         while t < audio_duration:
             # 1) annotation 구간 내이면 건너뛰기
@@ -237,13 +238,13 @@ def compute_curve_metrics(
                 t += neg_window_step
                 continue
 
-            # 2) 기존 candidate 근처이면 건너뛰기 (이미 처리됨)
-            near_candidate = False
-            for ct in cand_times:
+            # 2) 매칭된(TP) candidate 근처이면 건너뛰기
+            near_matched = False
+            for ct in matched_cand_times:
                 if abs(t - ct) <= tolerance:
-                    near_candidate = True
+                    near_matched = True
                     break
-            if near_candidate:
+            if near_matched:
                 t += neg_window_step
                 continue
 
@@ -253,6 +254,15 @@ def compute_curve_metrics(
             n_virtual += 1
 
             t += neg_window_step
+
+    # 양/음성 모두 없으면 최소 가상 음성 강제 추가 (곡선 계산용)
+    if n_virtual == 0 and n_neg_cand == 0:
+        # 최소 3개의 가상 음성 추가 (score = 전체 최저의 절반)
+        fallback_score = float(min(y_scores) * 0.5) if y_scores else 0.0
+        for _ in range(3):
+            y_true.append(0)
+            y_scores.append(fallback_score)
+            n_virtual += 1
 
     print(f"[DEBUG] curve_metrics: 가상 음성 {n_virtual}건 추가 (score={virtual_neg_score:.4f}, audio_duration={audio_duration}, step={neg_window_step})")
 
@@ -317,7 +327,7 @@ def compute_curve_metrics(
     # Tier 1 결과 추가 (후보 내 AUROC — composite score의 순수 변별력)
     if auroc_candidates is not None:
         result["auroc_candidates_only"] = round(auroc_candidates, 4)
-
+ 
     # ── Tier 2: 통과 후보(passed)의 precision ──
     # 실제 사용자가 듣는 결과물의 정밀도 측정
     passed_cands = [c for c in sp_cands if c.get("passed", False)]
@@ -343,7 +353,7 @@ def compute_curve_metrics(
         result["passed_count"] = len(passed_cands)
         result["passed_tp"] = n_passed_tp
         print(f"[DEBUG] curve_metrics: 통과 후보 정밀도 = {n_passed_tp}/{len(passed_cands)} = {passed_precision:.4f}")
-
+ 
     return result
 
 
