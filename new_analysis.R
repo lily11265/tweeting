@@ -37,7 +37,7 @@ DEFAULT_WEIGHTS <- list(
   dtw_env        = 0.08, # 진폭 포락선 DTW
   band_energy    = 0.13, # 주파수 대역 에너지 집중도
   harmonic_ratio = 0.18, # C1: 조화 비율 (새소리 주기성)
-  snr            = 0.12 # 신호 대 잡음비
+  snr            = 0.12 # C1.5: 신호 대 잡음비
 )
 
 # 1단계 후보 검출용 넓은 cutoff (본래 cutoff의 이 비율)
@@ -491,7 +491,7 @@ compute_mfcc_similarity <- function(wav_template, wav_segment, numcep = 13) {
       norm_t <- sqrt(sum(mean_t^2))
       norm_s <- sqrt(sum(mean_s^2))
 
-      if (!is.finite(norm_t) || !is.finite(norm_s) || norm_t == 0 || norm_s == 0) {
+      if (norm_t == 0 || norm_s == 0) {
         return(0)
       }
 
@@ -926,7 +926,9 @@ compute_snr_ratio <- function(wav_segment, f_low, f_high) {
       # (bin 수로 정규화하여 대역 너비에 무관하게)
       n_in <- sum(in_band)
       n_out <- sum(!in_band)
-      if (n_in == 0 || n_out == 0) return(0)
+      if (n_in == 0 || n_out == 0) {
+        return(0)
+      }
 
       mean_signal <- signal_power / n_in
       mean_noise <- noise_power / n_out
@@ -945,9 +947,6 @@ compute_snr_ratio <- function(wav_segment, f_low, f_high) {
     }
   )
 }
-
-# ============================================================
-# C2: NMS (Non-Maximum Suppression) 함수
 # ============================================================
 #' 근접 검출 병합: min_gap(초) 이내의 검출 중 최고 점수만 유지
 nms_detections <- function(df, min_gap = 0.5) {
@@ -1156,12 +1155,12 @@ auto_tune_weights <- function(wav, templates_info) {
   min_neg_required <- 10
   neg_factor <- 0.7 # 시작: sim_threshold * 0.7
   neg_indices <- which(window_max_sims < sim_threshold * neg_factor &
-                        window_max_sims < 1.0) # sim=1.0 (템플릿 겹침) 제외
+    window_max_sims < 1.0) # sim=1.0 (템플릿 겹침) 제외
 
   while (length(neg_indices) < min_neg_required && neg_factor < 0.95) {
     neg_factor <- neg_factor + 0.05
     neg_indices <- which(window_max_sims < sim_threshold * neg_factor &
-                          window_max_sims < 1.0)
+      window_max_sims < 1.0)
   }
 
   # 여전히 부족하면: 유사도 하위 N개를 강제 음성으로 사용
@@ -1173,11 +1172,15 @@ auto_tune_weights <- function(wav, templates_info) {
     } else if (length(non_template_indices) > 0) {
       neg_indices <- non_template_indices
     }
-    log_info(sprintf("  ⚠ 음성 부족 → 유사도 하위 %d개 강제 사용 (factor=%.2f)",
-                     length(neg_indices), neg_factor))
+    log_info(sprintf(
+      "  ⚠ 음성 부족 → 유사도 하위 %d개 강제 사용 (factor=%.2f)",
+      length(neg_indices), neg_factor
+    ))
   } else {
-    log_info(sprintf("  음성 임계값: sim < %.3f (factor=%.2f, %d건)",
-                     sim_threshold * neg_factor, neg_factor, length(neg_indices)))
+    log_info(sprintf(
+      "  음성 임계값: sim < %.3f (factor=%.2f, %d건)",
+      sim_threshold * neg_factor, neg_factor, length(neg_indices)
+    ))
   }
 
   # 유사도 기준 정렬 후 균등 간격 서브샘플링
@@ -1325,20 +1328,17 @@ auto_tune_weights <- function(wav, templates_info) {
         ns <- sd(loo_neg, na.rm = TRUE)
         ps_d <- sqrt((ps^2 + ns^2) / 2)
         if (is.na(ps_d) || ps_d < 0.001) ps_d <- 0.001
-        d_val <- (pm - nm) / ps_d
-        loo_ds[li] <- if (is.finite(d_val)) max(0, d_val) else 0
+        loo_ds[li] <- max(0, (pm - nm) / ps_d)
       }
 
-      disc_power[mi] <- mean(loo_ds, na.rm = TRUE)
-      if (!is.finite(disc_power[mi])) disc_power[mi] <- 0
+      disc_power[mi] <- mean(loo_ds)
     } else {
       # 샘플 부족 시 기존 방식
       pos_sd <- sd(pos_vals, na.rm = TRUE)
       neg_sd <- sd(neg_vals, na.rm = TRUE)
       pooled_sd <- sqrt((pos_sd^2 + neg_sd^2) / 2)
       if (is.na(pooled_sd) || pooled_sd < 0.001) pooled_sd <- 0.001
-      d_val2 <- (pos_mean - neg_mean) / pooled_sd
-      disc_power[mi] <- if (is.finite(d_val2)) max(0, d_val2) else 0
+      disc_power[mi] <- max(0, (pos_mean - neg_mean) / pooled_sd)
     }
   }
 
@@ -1351,8 +1351,8 @@ auto_tune_weights <- function(wav, templates_info) {
   }
 
   # 7) 변별력을 가중치로 변환 (정규화)
-  total_disc <- sum(disc_power, na.rm = TRUE)
-  if (!is.finite(total_disc) || total_disc < 0.001) {
+  total_disc <- sum(disc_power)
+  if (total_disc < 0.001) {
     log_info("  ⚠ 모든 지표의 변별력이 0 → 기본 가중치 사용")
     optimal_weights <- DEFAULT_WEIGHTS
   } else {
@@ -2622,3 +2622,4 @@ cat(sprintf("  기존 호환:  %s\n", file.path(output_dir, "results.csv")))
 cat(sprintf("  상세 결과:  %s\n", file.path(output_dir, "results_detailed.csv")))
 cat(sprintf("  전체 후보:  %s\n", file.path(output_dir, "candidates_all.csv")))
 cat("[DONE]\n")
+
