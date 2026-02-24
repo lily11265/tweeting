@@ -356,6 +356,13 @@ validate_and_fix_freq_range <- function(wav, f_low, f_high, t_start = NULL, t_en
           f_low <- auto$f_low
           f_high <- auto$f_high
         }
+      } else if (user_ratio < 0.05) {
+        # 1~5% 에너지: 자동보정은 하지 않으나 경고 표시
+        log_info(sprintf(
+          "  ⚠ 경고: 사용자 대역 [%.2f-%.2f kHz] 에너지 %.1f%% (낮음)",
+          f_low, f_high, user_ratio * 100
+        ))
+        log_info("     대역 설정이 실제 울음 주파수와 다를 수 있습니다. 확인하세요.")
       }
     }
   }
@@ -483,19 +490,25 @@ compute_mfcc_similarity <- function(wav_template, wav_segment, numcep = 13) {
       }
 
       # 프레임별 평균 MFCC 벡터로 요약 (전체 특성)
-      mean_t <- colMeans(mfcc_t)
-      mean_s <- colMeans(mfcc_s)
+      mean_t <- colMeans(mfcc_t, na.rm = TRUE)
+      mean_s <- colMeans(mfcc_s, na.rm = TRUE)
+
+      # NaN/NA 보호: melfcc가 NaN을 반환하면 유사도 계산 불가
+      if (any(is.na(mean_t)) || any(is.na(mean_s))) {
+        return(0)
+      }
 
       # 코사인 유사도
       dot_prod <- sum(mean_t * mean_s)
       norm_t <- sqrt(sum(mean_t^2))
       norm_s <- sqrt(sum(mean_s^2))
 
-      if (norm_t == 0 || norm_s == 0) {
+      if (is.na(norm_t) || is.na(norm_s) || norm_t == 0 || norm_s == 0) {
         return(0)
       }
 
       sim <- dot_prod / (norm_t * norm_s)
+      if (is.na(sim)) return(0)
       # -1~1을 0~1로 스케일링
       max(0, (sim + 1) / 2)
     },
@@ -975,6 +988,179 @@ nms_detections <- function(df, min_gap = 0.5) {
 }
 
 # ============================================================
+# ★ 후보 간 지표 정규화 + 복합점수 재산출
+# 각 지표를 후보 풀 내에서 min-max 스케일링하여
+# 분산 없는(비구별) 지표의 상수 기여를 제거함
+# → 가중치가 큰 구별 지표가 복합점수를 실제로 주도
+# ============================================================
+normalize_candidate_scores <- function(df, weights) {
+  if (is.null(df) || nrow(df) < 3) return(df)
+
+  metric_cols <- c("cor_score", "mfcc_score", "dtw_freq", "dtw_env",
+                    "band_energy", "harmonic_ratio", "snr")
+  available <- intersect(metric_cols, names(df))
+
+  # 정규화 전 범위 로깅
+  range_strs <- vapply(available, function(mn) {
+    vals <- df[[mn]]
+    sprintf("%s=[%.3f,%.3f]", mn, min(vals, na.rm = TRUE), max(vals, na.rm = TRUE))
+  }, character(1))
+  log_info(sprintf("  ★ 정규화 전 범위: %s", paste(range_strs, collapse = ", ")))
+
+  # 지표별 min-max 정규화
+  norm_data <- list()
+  for (mn in available) {
+    vals <- df[[mn]]
+    vmin <- min(vals, na.rm = TRUE)
+    vmax <- max(vals, na.rm = TRUE)
+    vrange <- vmax - vmin
+
+    if (vrange > 1e-6) {
+      norm_data[[mn]] <- (vals - vmin) / vrange
+    } else {
+      # 분산 없음 → 0.5 (판별 기여 없음)
+      norm_data[[mn]] <- rep(0.5, length(vals))
+    }
+  }
+
+  # 정규화된 점수로 복합점수 재계산
+  for (j in seq_len(nrow(df))) {
+    scores_list <- lapply(available, function(mn) norm_data[[mn]][j])
+    names(scores_list) <- available
+    df$composite[j] <- round(compute_composite_score(scores_list, weights), 4)
+  }
+
+  log_info(sprintf("  ★ 정규화 후 종합점수: %.3f ~ %.3f (범위 %.3f)",
+    min(df$composite, na.rm = TRUE), max(df$composite, na.rm = TRUE),
+    max(df$composite, na.rm = TRUE) - min(df$composite, na.rm = TRUE)))
+
+  df
+}
+
+# ============================================================
+# ★ 후보 위치 보정: 대역 에너지 포락선 기반 피크 재정렬
+# corMatch는 부분 매칭으로 울음의 시작/끝에 피크가 생기기 쉬움
+# → 대역 에너지가 최대인 실제 울음 중심으로 이동
+# ============================================================
+
+#' 전체 음원의 대역 에너지 포락선을 한 번만 계산 (O(N))
+#' bandpass filter → 제곱 → 이동 평균 → 시간별 에너지 맵
+#' @param wav 전체 음원 Wave 객체
+#' @param f_low 주파수 하한 (kHz)
+#' @param f_high 주파수 상한 (kHz)
+#' @param window_sec 에너지 계산 윈도우 크기 (초)
+#' @return list(energy, sr) 또는 NULL
+compute_band_energy_envelope <- function(wav, f_low, f_high, window_sec = 0.05) {
+  tryCatch(
+    {
+      sr <- wav@samp.rate
+
+      # 밴드패스 필터링 (전체 음원 1회)
+      bp_from <- f_low * 1000 # kHz → Hz
+      bp_to <- min(f_high * 1000, sr / 2 - 1)
+      if (bp_from >= bp_to || bp_from < 1) return(NULL)
+
+      filtered <- seewave::ffilter(wav,
+        f = sr, from = bp_from, to = bp_to,
+        output = "Wave"
+      )
+
+      # ★ 에너지 집중도(비율) 포락선: 대역 에너지 / 전체 에너지
+      # 절대 에너지가 아닌 비율을 사용해야 큰 소음에 끌리지 않고
+      # 실제로 대역에 에너지가 집중된 구간(새소리)을 찾음
+      sig_band <- as.numeric(filtered@left)^2
+      sig_total <- as.numeric(wav@left)^2
+
+      win_samples <- max(1, round(window_sec * sr))
+      kernel <- rep(1 / win_samples, win_samples)
+      energy_band <- stats::filter(sig_band, kernel, sides = 2)
+      energy_total <- stats::filter(sig_total, kernel, sides = 2)
+      energy_band[is.na(energy_band)] <- 0
+      energy_total[is.na(energy_total)] <- 0
+
+      ratio <- as.numeric(energy_band) / (as.numeric(energy_total) + 1e-10)
+
+      list(energy = ratio, sr = sr)
+    },
+    error = function(e) {
+      log_debug(sprintf("  에너지 포락선 계산 오류: %s", e$message))
+      NULL
+    }
+  )
+}
+
+#' corMatch 피크를 대역 에너지 최대 지점으로 보정
+#' @param energy_env compute_band_energy_envelope() 결과
+#' @param peak_time corMatch 피크 시간 (초)
+#' @param ref_duration 템플릿 길이 (초)
+#' @return 보정된 피크 시간 (초)
+refine_peak_position <- function(energy_env, peak_time, ref_duration) {
+  if (is.null(energy_env)) return(peak_time)
+
+  sr <- energy_env$sr
+  n <- length(energy_env$energy)
+
+  # 탐색 범위: corMatch 피크 기준 ±1 템플릿 길이
+  search_radius_samples <- round(ref_duration * sr)
+  peak_sample <- max(1, round(peak_time * sr))
+
+  s_start <- max(1, peak_sample - search_radius_samples)
+  s_end <- min(n, peak_sample + search_radius_samples)
+
+  if (s_end <= s_start) return(peak_time)
+
+  region <- energy_env$energy[s_start:s_end]
+  best_offset <- which.max(region) - 1
+  refined_time <- (s_start + best_offset) / sr
+
+  refined_time
+}
+
+#' 대역 에너지 포락선에서 피크를 탐색하여 후보 시간 목록을 반환
+#' corMatch가 놓친 울음 구간을 보충하는 용도
+#' @param energy_env compute_band_energy_envelope() 결과
+#' @param ref_duration 템플릿 길이 (초) — 최소 피크 간격으로 사용
+#' @return 피크 시간 벡터 (초)
+find_energy_peaks <- function(energy_env, ref_duration) {
+  if (is.null(energy_env)) return(numeric(0))
+
+  sr <- energy_env$sr
+  ratio <- energy_env$energy
+  n <- length(ratio)
+
+  # 최소 피크 간격 = 템플릿 길이
+  gap_samples <- round(ref_duration * sr)
+
+  # 적응형 임계값: 중앙값 + 2×MAD (이상치에 견고)
+  med <- median(ratio)
+  mad_val <- mad(ratio)
+  threshold <- med + 2 * mad_val
+  # 최소 기준: 에너지 집중도 1% 이상
+  threshold <- max(threshold, 0.01)
+
+  # Greedy 피크 검출: 최고점 선택 → ±gap 제외 → 반복
+  peaks <- numeric(0)
+  remaining <- seq_len(n)
+
+  while (length(remaining) > 0) {
+    best_in_remaining <- which.max(ratio[remaining])
+    max_idx <- remaining[best_in_remaining]
+
+    if (ratio[max_idx] < threshold) break
+
+    peaks <- c(peaks, max_idx)
+
+    # ±gap 범위 제외
+    exclude_start <- max(1, max_idx - gap_samples)
+    exclude_end <- min(n, max_idx + gap_samples)
+    remaining <- remaining[remaining < exclude_start | remaining > exclude_end]
+  }
+
+  # 시간으로 변환하여 정렬
+  sort(peaks / sr)
+}
+
+# ============================================================
 # ★ 자동 튜닝: 종 음원 자가진단으로 최적 가중치 결정
 # ============================================================
 #' 종 음원 내에서 자가진단을 수행하여 최적 가중치를 자동으로 결정한다.
@@ -1149,38 +1335,85 @@ auto_tune_weights <- function(wav, templates_info) {
   # ★ 계층적 샘플링: 시간 순서대로가 아닌, 유사도 분포에서 균등 추출
   #    양성은 가장 유사한 것부터, 음성은 가장 비유사한 것부터 추출하되
   #    다양한 유사도 수준을 포함하도록 함
-  pos_indices <- which(window_max_sims >= sim_threshold)
 
-  # ★ 적응형 음성 임계값: 최소 10개 음성을 확보할 때까지 단계적 완화
-  min_neg_required <- 10
-  neg_factor <- 0.7 # 시작: sim_threshold * 0.7
-  neg_indices <- which(window_max_sims < sim_threshold * neg_factor &
-    window_max_sims < 1.0) # sim=1.0 (템플릿 겹침) 제외
+  # ★ 비겹침 윈도우만 분류 대상 (sim=1.0은 확정 양성 — 템플릿 자체)
+  non_template_indices <- which(window_max_sims < 1.0)
 
-  while (length(neg_indices) < min_neg_required && neg_factor < 0.95) {
-    neg_factor <- neg_factor + 0.05
-    neg_indices <- which(window_max_sims < sim_threshold * neg_factor &
-      window_max_sims < 1.0)
+  # 분류 전략 결정: 절대 임계값 vs 상대 분위수
+  # 비겹침 윈도우의 중앙값이 임계값 이상이면 절대 임계값으로는 분리 불가
+  # → 상대 분위수 기반 분류로 전환
+  use_percentile_split <- FALSE
+  if (length(non_template_indices) >= 6) {
+    nt_sims <- window_max_sims[non_template_indices]
+    n_above_threshold <- sum(nt_sims >= sim_threshold)
+    n_below_threshold <- sum(nt_sims < sim_threshold)
+
+    # 음성이 전체의 15% 미만이면 절대 임계값이 부적합
+    if (n_below_threshold < length(non_template_indices) * 0.15) {
+      use_percentile_split <- TRUE
+      log_info(sprintf(
+        "  ⚠ 절대 임계값(%.3f)으로 분리 불가 (이상:%d, 미만:%d) → 분위수 기반 분류",
+        sim_threshold, n_above_threshold, n_below_threshold
+      ))
+    }
   }
 
-  # 여전히 부족하면: 유사도 하위 N개를 강제 음성으로 사용
-  if (length(neg_indices) < min_neg_required) {
-    non_template_indices <- which(window_max_sims < 1.0) # 템플릿 겹침 제외
-    if (length(non_template_indices) >= min_neg_required) {
-      sorted_idx <- non_template_indices[order(window_max_sims[non_template_indices])]
-      neg_indices <- sorted_idx[1:min(max_samples, length(sorted_idx))]
-    } else if (length(non_template_indices) > 0) {
-      neg_indices <- non_template_indices
-    }
+  if (use_percentile_split) {
+    # ★ 분위수 기반 분류: 상위 30% = 양성, 하위 30% = 음성
+    # 중간 40%는 애매한 구간이므로 제외
+    nt_sims <- window_max_sims[non_template_indices]
+    q_high <- quantile(nt_sims, 0.70) # 상위 30% 경계
+    q_low  <- quantile(nt_sims, 0.30) # 하위 30% 경계
+
+    # 템플릿 겹침(sim=1.0)은 확정 양성에 포함
+    pos_indices <- c(
+      which(window_max_sims == 1.0),
+      non_template_indices[nt_sims >= q_high]
+    )
+    neg_indices <- non_template_indices[nt_sims <= q_low]
+
     log_info(sprintf(
-      "  ⚠ 음성 부족 → 유사도 하위 %d개 강제 사용 (factor=%.2f)",
-      length(neg_indices), neg_factor
+      "  분위수 분류: 양성 임계값=%.3f (상위 30%%), 음성 임계값=%.3f (하위 30%%)",
+      q_high, q_low
+    ))
+    log_info(sprintf(
+      "  양성 후보=%d, 음성 후보=%d (총 비겹침=%d)",
+      length(pos_indices), length(neg_indices), length(non_template_indices)
     ))
   } else {
-    log_info(sprintf(
-      "  음성 임계값: sim < %.3f (factor=%.2f, %d건)",
-      sim_threshold * neg_factor, neg_factor, length(neg_indices)
-    ))
+    # 원래 절대 임계값 기반 분류
+    pos_indices <- which(window_max_sims >= sim_threshold)
+
+    # ★ 적응형 음성 임계값: 최소 10개 음성을 확보할 때까지 단계적 완화
+    min_neg_required <- 10
+    neg_factor <- 0.7 # 시작: sim_threshold * 0.7
+    neg_indices <- which(window_max_sims < sim_threshold * neg_factor &
+      window_max_sims < 1.0) # sim=1.0 (템플릿 겹침) 제외
+
+    while (length(neg_indices) < min_neg_required && neg_factor < 0.95) {
+      neg_factor <- neg_factor + 0.05
+      neg_indices <- which(window_max_sims < sim_threshold * neg_factor &
+        window_max_sims < 1.0)
+    }
+
+    # 여전히 부족하면: 유사도 하위 N개를 강제 음성으로 사용
+    if (length(neg_indices) < min_neg_required) {
+      if (length(non_template_indices) >= min_neg_required) {
+        sorted_idx <- non_template_indices[order(window_max_sims[non_template_indices])]
+        neg_indices <- sorted_idx[1:min(max_samples, length(sorted_idx))]
+      } else if (length(non_template_indices) > 0) {
+        neg_indices <- non_template_indices
+      }
+      log_info(sprintf(
+        "  ⚠ 음성 부족 → 유사도 하위 %d개 강제 사용 (factor=%.2f)",
+        length(neg_indices), neg_factor
+      ))
+    } else {
+      log_info(sprintf(
+        "  음성 임계값: sim < %.3f (factor=%.2f, %d건)",
+        sim_threshold * neg_factor, neg_factor, length(neg_indices)
+      ))
+    }
   }
 
   # 유사도 기준 정렬 후 균등 간격 서브샘플링
@@ -1195,15 +1428,21 @@ auto_tune_weights <- function(wav, templates_info) {
     neg_indices <- neg_indices[seq(1, length(neg_indices), by = step_n)][1:min(max_samples, length(neg_indices))]
   }
 
+  # ★ 윈도우 역할 맵: 어떤 인덱스가 양성/음성으로 배정되었는지 추적
+  # 이후 루프에서 재분류하지 않고 이 맵을 사용
+  window_role <- rep("skip", n_windows)
+  window_role[pos_indices] <- "positive"
+  window_role[neg_indices] <- "negative"
+
   sample_indices <- c(pos_indices, neg_indices)
 
   for (wi in sample_indices) {
     w_start <- window_starts[wi]
     w_end <- w_start + window_dur
-    sim <- window_max_sims[wi]
 
-    is_positive <- sim >= sim_threshold
-    is_negative <- sim < sim_threshold * 0.7
+    # ★ 사전 배정된 역할 사용 (재분류하지 않음)
+    is_positive <- window_role[wi] == "positive"
+    is_negative <- window_role[wi] == "negative"
 
     if (!is_positive && !is_negative) next
 
@@ -1350,6 +1589,20 @@ auto_tune_weights <- function(wav, templates_info) {
     ))
   }
 
+  # ★ 역방향 지표 처리: 양성 평균 ≤ 음성 평균이면 변별력 0
+  # (점수가 높을수록 새소리가 아닌 방향 → 복합점수 압축의 원인)
+  for (mi in seq_along(metric_names)) {
+    if (pos_means[mi] <= neg_means[mi]) {
+      if (disc_power[mi] > 0) {
+        log_info(sprintf(
+          "    ★ %s: 역방향 (양성=%.3f ≤ 음성=%.3f) → 가중치 0",
+          metric_names[mi], pos_means[mi], neg_means[mi]
+        ))
+      }
+      disc_power[mi] <- 0
+    }
+  }
+
   # 7) 변별력을 가중치로 변환 (정규화)
   total_disc <- sum(disc_power)
   if (total_disc < 0.001) {
@@ -1360,10 +1613,8 @@ auto_tune_weights <- function(wav, templates_info) {
     #    한 지표에 가중치가 과도하게 몰리는 것을 방지
     raw_weights <- sqrt(disc_power) / sum(sqrt(disc_power))
 
-    min_w <- 0.05
-    raw_weights <- pmax(raw_weights, min_w)
-    raw_weights <- raw_weights / sum(raw_weights)
-
+    # ★ 최소 가중치 제거: 변별력 없는 지표는 가중치 0
+    # (기존 min_w=0.05가 비구별 지표의 상수 기여를 유발하여 점수 압축)
     optimal_weights <- as.list(raw_weights)
     names(optimal_weights) <- metric_names
   }
@@ -2165,6 +2416,7 @@ sp_name_to_idx <- setNames(
 
 # C5: 템플릿별 독립 평가 후 종 단위 병합
 all_template_results <- list()
+template_weights_map <- list()  # ★ 종별 가중치 보관 (정규화 시 사용)
 
 for (t_idx in seq_along(template_names)) {
   tmpl_name <- template_names[t_idx]
@@ -2218,6 +2470,7 @@ for (t_idx in seq_along(template_names)) {
     if (total_w > 0) sp_weights <- lapply(sp_weights, function(w) w / total_w)
   }
   final_cutoff <- sp_conf$cutoff
+  template_weights_map[[tmpl_name]] <- sp_weights  # ★ 정규화용 가중치 보관
 
   if (is.null(det) || nrow(det) == 0) {
     cat(sprintf("\n  [%s] 후보 0건 → 건너뜀\n", tmpl_name))
@@ -2236,12 +2489,28 @@ for (t_idx in seq_along(template_names)) {
   # 레퍼런스 길이 (초)
   ref_duration <- if (!is.null(ref_wav)) length(ref_wav@left) / ref_wav@samp.rate else 1.0
 
+  # ★ 대역 에너지 포락선 1회 사전 계산 (피크 위치 보정용)
+  band_env <- compute_band_energy_envelope(
+    main_wav, ref_freq$f_low, ref_freq$f_high,
+    window_sec = min(0.05, ref_duration * 0.1)
+  )
+  if (!is.null(band_env)) {
+    log_info(sprintf("  ★ 대역 에너지 포락선 계산 완료 (피크 보정 활성)"))
+  }
+
   # 각 후보 구간 평가
   sp_results <- vector("list", nrow(det))
+  n_refined <- 0
 
   for (j in seq_len(nrow(det))) {
-    peak_time <- det$time[j]
+    peak_time_orig <- det$time[j]
     cor_score <- det$score[j]
+
+    # ★ 피크 위치 보정: 대역 에너지 최대 지점으로 재정렬
+    peak_time <- refine_peak_position(band_env, peak_time_orig, ref_duration)
+    if (abs(peak_time - peak_time_orig) > ref_duration * 0.1) {
+      n_refined <- n_refined + 1
+    }
 
     # 후보 구간 추출
     margin <- ref_duration * 0.2
@@ -2330,6 +2599,72 @@ for (t_idx in seq_along(template_names)) {
     }
   }
 
+  if (n_refined > 0) {
+    log_info(sprintf("  ★ 피크 보정: %d/%d건 위치 재조정 (대역 에너지 기반)", n_refined, nrow(det)))
+  }
+
+  # ★ 에너지 피크 보충: corMatch가 놓친 울음 구간을 대역 에너지 포락선으로 탐색
+  if (!is.null(band_env) && !is.null(ref_wav)) {
+    energy_peaks <- find_energy_peaks(band_env, ref_duration)
+
+    # 기존 후보와 겹치지 않는 에너지 피크만 추가
+    existing_times <- sapply(sp_results, function(r) {
+      if (is.null(r)) NA else r$time[1]
+    })
+    existing_times <- existing_times[!is.na(existing_times)]
+    min_gap_sec <- max(0.5, ref_duration * 0.5)
+
+    n_energy_added <- 0
+    for (ep in energy_peaks) {
+      if (length(existing_times) > 0 && any(abs(existing_times - ep) < min_gap_sec)) next
+
+      margin <- ref_duration * 0.2
+      seg_start <- max(0, ep - ref_duration / 2 - margin)
+      seg_end <- ep + ref_duration / 2 + margin
+      segment <- extract_segment(main_wav, seg_start, seg_end)
+      if (is.null(segment) || length(segment@left) < 100) next
+
+      individual_scores <- list(cor_score = 0)
+      individual_scores$band_energy <- compute_band_energy_ratio(
+        segment, ref_freq$f_low, ref_freq$f_high
+      )
+      individual_scores$harmonic_ratio <- compute_harmonic_ratio(
+        segment, ref_freq$f_low, ref_freq$f_high
+      )
+      individual_scores$snr <- compute_snr_ratio(
+        segment, ref_freq$f_low, ref_freq$f_high
+      )
+      individual_scores$mfcc_score <- compute_mfcc_dtw_similarity(ref_wav, segment)
+      individual_scores$dtw_freq <- compute_freq_contour_dtw(
+        ref_wav, segment, ref_freq$f_low, ref_freq$f_high
+      )
+      individual_scores$dtw_env <- compute_envelope_dtw(ref_wav, segment)
+
+      composite <- compute_composite_score(individual_scores, sp_weights)
+
+      n_energy_added <- n_energy_added + 1
+      sp_results[[length(sp_results) + 1]] <- data.frame(
+        species = sp_name,
+        time = ep,
+        cor_score = 0,
+        mfcc_score = round(individual_scores$mfcc_score, 4),
+        dtw_freq = round(individual_scores$dtw_freq, 4),
+        dtw_env = round(individual_scores$dtw_env, 4),
+        band_energy = round(individual_scores$band_energy, 4),
+        harmonic_ratio = round(individual_scores$harmonic_ratio, 4),
+        snr = round(individual_scores$snr, 4),
+        composite = round(composite, 4),
+        template_label = tmpl_name,
+        stringsAsFactors = FALSE
+      )
+      existing_times <- c(existing_times, ep)
+    }
+
+    if (n_energy_added > 0) {
+      log_info(sprintf("  ★ 에너지 피크 보충: %d건 추가 후보 (corMatch 미검출 구간)", n_energy_added))
+    }
+  }
+
   # 결합
   sp_df <- do.call(rbind, sp_results)
   all_template_results[[tmpl_name]] <- sp_df
@@ -2353,6 +2688,12 @@ for (sp_name in species_names_unique) {
   }
 
   combined <- do.call(rbind, sp_dfs)
+
+  # ★ 후보 간 정규화: 비구별 지표의 상수 기여 제거 → 점수 압축 방지
+  sp_w <- template_weights_map[[sp_tmpl_names[1]]]
+  if (!is.null(sp_w) && nrow(combined) >= 3) {
+    combined <- normalize_candidate_scores(combined, sp_w)
+  }
 
   # 최종 cutoff 적용
   sp_conf <- species_list[[sp_name_to_idx[sp_name]]]
