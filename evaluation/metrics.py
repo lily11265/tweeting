@@ -318,6 +318,32 @@ def compute_curve_metrics(
     if auroc_candidates is not None:
         result["auroc_candidates_only"] = round(auroc_candidates, 4)
 
+    # ── Tier 2: 통과 후보(passed)의 precision ──
+    # 실제 사용자가 듣는 결과물의 정밀도 측정
+    passed_cands = [c for c in sp_cands if c.get("passed", False)]
+    if passed_cands:
+        n_passed_tp = 0
+        for cand in passed_cands:
+            cand_time = cand["time"]
+            matched = False
+            for ann in sp_anns:
+                ann_file = ann.get("file", "")
+                cand_file = cand.get("file", "")
+                if not ignore_file and ann_file != cand_file:
+                    import os
+                    if os.path.basename(ann_file) != os.path.basename(cand_file):
+                        continue
+                if ann["t_start"] - tolerance <= cand_time <= ann["t_end"] + tolerance:
+                    matched = True
+                    break
+            if matched:
+                n_passed_tp += 1
+        passed_precision = n_passed_tp / len(passed_cands)
+        result["passed_precision"] = round(passed_precision, 4)
+        result["passed_count"] = len(passed_cands)
+        result["passed_tp"] = n_passed_tp
+        print(f"[DEBUG] curve_metrics: 통과 후보 정밀도 = {n_passed_tp}/{len(passed_cands)} = {passed_precision:.4f}")
+
     return result
 
 

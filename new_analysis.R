@@ -31,12 +31,13 @@ MAX_SAMPLE_RATE <- 48000
 
 # 종합 점수 기본 가중치 (config에서 종별 오버라이드 가능)
 DEFAULT_WEIGHTS <- list(
-  cor_score      = 0.20, # 스펙트로그램 상관
-  mfcc_score     = 0.20, # MFCC DTW 유사도
-  dtw_freq       = 0.15, # 주파수 궤적 DTW
-  dtw_env        = 0.10, # 진폭 포락선 DTW
-  band_energy    = 0.15, # 주파수 대역 에너지 집중도
-  harmonic_ratio = 0.20 # C1: 조화 비율 (새소리 주기성)
+  cor_score      = 0.18, # 스펙트로그램 상관
+  mfcc_score     = 0.18, # MFCC DTW 유사도
+  dtw_freq       = 0.13, # 주파수 궤적 DTW
+  dtw_env        = 0.08, # 진폭 포락선 DTW
+  band_energy    = 0.13, # 주파수 대역 에너지 집중도
+  harmonic_ratio = 0.18, # C1: 조화 비율 (새소리 주기성)
+  snr            = 0.12  # C1.5: 신호 대 잡음비
 )
 
 # 1단계 후보 검출용 넓은 cutoff (본래 cutoff의 이 비율)
@@ -848,7 +849,55 @@ compute_harmonic_ratio <- function(wav_segment, f_low, f_high) {
   )
 }
 # ============================================================
-# C2: NMS (Non-Maximum Suppression) 함수
+# C1.5: SNR (Signal-to-Noise Ratio) 추정 함수
+# ============================================================
+#' 대역 내 에너지와 대역 외 에너지의 비율로 SNR을 추정한다.
+#' 새소리 주파수 대역에 에너지가 집중될수록 SNR이 높고,
+#' 배경 소음이 많으면 대역 외에도 에너지가 분산되어 SNR이 낮아진다.
+#' @param wav_segment Wave 객체
+#' @param f_low 종 주파수 하한 (kHz)
+#' @param f_high 종 주파수 상한 (kHz)
+#' @return 0~1 정규화된 SNR (높을수록 깨끗한 신호)
+compute_snr_ratio <- function(wav_segment, f_low, f_high) {
+  tryCatch(
+    {
+      sr <- wav_segment@samp.rate
+      spec <- meanspec(wav_segment, f = sr, plot = FALSE)
+      if (is.null(spec) || nrow(spec) < 10) {
+        return(0)
+      }
+
+      freqs <- spec[, 1] # kHz
+      power <- spec[, 2]^2 # 파워 스펙트럼
+
+      # 대역 내 에너지
+      in_band <- freqs >= f_low & freqs <= f_high
+      signal_power <- sum(power[in_band])
+
+      # 대역 외 에너지 (전체 - 대역 내)
+      noise_power <- sum(power[!in_band])
+
+      if (signal_power + noise_power < 1e-10) {
+        return(0)
+      }
+
+      # dB 스케일 SNR → 0~1 시그모이드 정규화
+      # SNR(dB) = 10 * log10(signal / noise)
+      # 0dB → 0.5, 10dB → ~0.9, -10dB → ~0.1
+      if (noise_power < 1e-10) {
+        return(1.0) # 소음 없음
+      }
+      snr_db <- 10 * log10(signal_power / noise_power)
+      # 시그모이드: 1 / (1 + exp(-k * (snr - midpoint)))
+      # midpoint=3dB, k=0.3 → 부드러운 전환
+      1 / (1 + exp(-0.3 * (snr_db - 3)))
+    },
+    error = function(e) {
+      log_debug(sprintf("    SNR 계산 오류: %s", e$message))
+      0
+    }
+  )
+}
 # ============================================================
 #' 근접 검출 병합: min_gap(초) 이내의 검출 중 최고 점수만 유지
 nms_detections <- function(df, min_gap = 0.5) {
@@ -1108,6 +1157,7 @@ auto_tune_weights <- function(wav, templates_info) {
         s$dtw_env <- compute_envelope_dtw(ref_seg, seg)
         s$band_energy <- compute_band_energy_ratio(seg, f_low, f_high)
         s$harmonic_ratio <- compute_harmonic_ratio(seg, f_low, f_high)
+        s$snr <- compute_snr_ratio(seg, f_low, f_high)
         s
       },
       error = function(e) NULL
@@ -1146,7 +1196,7 @@ auto_tune_weights <- function(wav, templates_info) {
   # 6) 각 지표별 변별력(discriminative power) 계산
   #    LOO 교차검증: 각 샘플을 한 번씩 제외하고 Cohen's d를 계산,
   #    평균을 취해 과적합 방지
-  metric_names <- c("cor_score", "mfcc_score", "dtw_freq", "dtw_env", "band_energy", "harmonic_ratio")
+  metric_names <- c("cor_score", "mfcc_score", "dtw_freq", "dtw_env", "band_energy", "harmonic_ratio", "snr")
   disc_power <- numeric(length(metric_names))
   names(disc_power) <- metric_names
 
@@ -1315,6 +1365,13 @@ run_mode <- if (!is.null(config$mode)) config$mode else "analyze"
 
 # 종합 판별 가중치 (config에서 오버라이드 가능)
 global_weights <- if (!is.null(config$weights)) config$weights else DEFAULT_WEIGHTS
+# 기존 config에 snr 가중치가 없으면 DEFAULT에서 보충
+if (is.null(global_weights$snr)) {
+  global_weights$snr <- DEFAULT_WEIGHTS$snr
+  # 재정규화 (합=1 유지)
+  total_w <- sum(unlist(global_weights))
+  if (total_w > 0) global_weights <- lapply(global_weights, function(w) w / total_w)
+}
 
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
@@ -1996,13 +2053,14 @@ print_section(
   "2단계: 종합 판별 (Composite Scoring)",
   c(
     sprintf(
-      "가중치: cor=%.0f%%, mfcc=%.0f%%, dtw_freq=%.0f%%, dtw_env=%.0f%%, band=%.0f%%, hr=%.0f%%",
+      "가중치: cor=%.0f%%, mfcc=%.0f%%, dtw_freq=%.0f%%, dtw_env=%.0f%%, band=%.0f%%, hr=%.0f%%, snr=%.0f%%",
       global_weights$cor_score * 100,
       global_weights$mfcc_score * 100,
       global_weights$dtw_freq * 100,
       global_weights$dtw_env * 100,
       global_weights$band_energy * 100,
-      global_weights$harmonic_ratio * 100
+      global_weights$harmonic_ratio * 100,
+      global_weights$snr * 100
     ),
     "각 후보 구간에 대해 6가지 지표를 종합 평가합니다."
   )
@@ -2053,16 +2111,22 @@ for (t_idx in seq_along(template_names)) {
       tune_res <- auto_tune_weights(sp_wav_for_tune, tune_templates_info)
       sp_weights <- tune_res$weights
       log_info(sprintf(
-        "  [%s] 자동 가중치: cor=%.3f mfcc=%.3f freq=%.3f env=%.3f band=%.3f hr=%.3f",
+        "  [%s] 자동 가중치: cor=%.3f mfcc=%.3f freq=%.3f env=%.3f band=%.3f hr=%.3f snr=%.3f",
         sp_name, sp_weights$cor_score, sp_weights$mfcc_score,
         sp_weights$dtw_freq, sp_weights$dtw_env, sp_weights$band_energy,
-        sp_weights$harmonic_ratio
+        sp_weights$harmonic_ratio, sp_weights$snr
       ))
     } else {
       sp_weights <- if (!is.null(sp_conf$weights)) sp_conf$weights else global_weights
     }
   } else {
     sp_weights <- if (!is.null(sp_conf$weights)) sp_conf$weights else global_weights
+  }
+  # snr 가중치 보충 (기존 config 호환)
+  if (is.null(sp_weights$snr)) {
+    sp_weights$snr <- DEFAULT_WEIGHTS$snr
+    total_w <- sum(unlist(sp_weights))
+    if (total_w > 0) sp_weights <- lapply(sp_weights, function(w) w / total_w)
   }
   final_cutoff <- sp_conf$cutoff
 
@@ -2100,7 +2164,7 @@ for (t_idx in seq_along(template_names)) {
       sp_results[[j]] <- data.frame(
         species = sp_name, time = peak_time,
         cor_score = cor_score, mfcc_score = 0, dtw_freq = 0,
-        dtw_env = 0, band_energy = 0, harmonic_ratio = 0,
+        dtw_env = 0, band_energy = 0, harmonic_ratio = 0, snr = 0,
         composite = cor_score * sp_weights$cor_score,
         template_label = tmpl_name,
         stringsAsFactors = FALSE
@@ -2109,6 +2173,7 @@ for (t_idx in seq_along(template_names)) {
     }
 
     # --- B5: Staged Evaluation (Early Rejection) ---
+    # 1단계: 빠르게 계산 가능한 지표 (스펙트럼 기반)
     individual_scores <- list(cor_score = max(0, cor_score))
     individual_scores$band_energy <- compute_band_energy_ratio(
       segment, ref_freq$f_low, ref_freq$f_high
@@ -2116,12 +2181,16 @@ for (t_idx in seq_along(template_names)) {
     individual_scores$harmonic_ratio <- compute_harmonic_ratio(
       segment, ref_freq$f_low, ref_freq$f_high
     )
+    individual_scores$snr <- compute_snr_ratio(
+      segment, ref_freq$f_low, ref_freq$f_high
+    )
 
     preliminary <- individual_scores$cor_score * sp_weights$cor_score +
       individual_scores$band_energy * sp_weights$band_energy +
-      individual_scores$harmonic_ratio * sp_weights$harmonic_ratio
+      individual_scores$harmonic_ratio * sp_weights$harmonic_ratio +
+      individual_scores$snr * sp_weights$snr
     remaining_weight <- 1 - sp_weights$cor_score - sp_weights$band_energy -
-      sp_weights$harmonic_ratio
+      sp_weights$harmonic_ratio - sp_weights$snr
     max_possible <- preliminary + remaining_weight
 
     if (max_possible < final_cutoff) {
@@ -2151,6 +2220,7 @@ for (t_idx in seq_along(template_names)) {
       dtw_env = round(individual_scores$dtw_env, 4),
       band_energy = round(individual_scores$band_energy, 4),
       harmonic_ratio = round(individual_scores$harmonic_ratio, 4),
+      snr = round(individual_scores$snr, 4),
       composite = round(composite, 4),
       template_label = tmpl_name,
       stringsAsFactors = FALSE
@@ -2158,13 +2228,14 @@ for (t_idx in seq_along(template_names)) {
 
     if (j == 1 || j %% 10 == 0 || j == nrow(det)) {
       cat(sprintf(
-        "    [%d/%d] t=%.1f, cor=%.3f, mfcc=%.3f, freq=%.3f, env=%.3f, band=%.3f → 종합=%.3f\n",
+        "    [%d/%d] t=%.1f, cor=%.3f, mfcc=%.3f, freq=%.3f, env=%.3f, band=%.3f, snr=%.3f → 종합=%.3f\n",
         j, nrow(det), peak_time,
         individual_scores$cor_score,
         individual_scores$mfcc_score,
         individual_scores$dtw_freq,
         individual_scores$dtw_env,
         individual_scores$band_energy,
+        individual_scores$snr,
         composite
       ))
     }
@@ -2212,9 +2283,10 @@ for (sp_name in species_names_unique) {
       best <- combined[best_idx, ]
       cat(sprintf("    ** 검출 없음. 최고 종합점수: %.4f (t=%.1f)\n", best$composite, best$time))
       cat(sprintf(
-        "       내역: cor=%.3f, mfcc=%.3f, freq=%.3f, env=%.3f, band=%.3f, hr=%.3f\n",
+        "       내역: cor=%.3f, mfcc=%.3f, freq=%.3f, env=%.3f, band=%.3f, hr=%.3f, snr=%.3f\n",
         best$cor_score, best$mfcc_score, best$dtw_freq, best$dtw_env,
-        best$band_energy, best$harmonic_ratio
+        best$band_energy, best$harmonic_ratio,
+        if ("snr" %in% names(best)) best$snr else 0
       ))
       if (best$composite > final_cutoff * 0.7) {
         cat(sprintf(
