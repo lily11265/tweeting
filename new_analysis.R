@@ -356,6 +356,13 @@ validate_and_fix_freq_range <- function(wav, f_low, f_high, t_start = NULL, t_en
           f_low <- auto$f_low
           f_high <- auto$f_high
         }
+      } else if (user_ratio < 0.05) {
+        # 1~5% 에너지: 자동보정은 하지 않으나 경고 표시
+        log_info(sprintf(
+          "  ⚠ 경고: 사용자 대역 [%.2f-%.2f kHz] 에너지 %.1f%% (낮음)",
+          f_low, f_high, user_ratio * 100
+        ))
+        log_info("     대역 설정이 실제 울음 주파수와 다를 수 있습니다. 확인하세요.")
       }
     }
   }
@@ -981,6 +988,56 @@ nms_detections <- function(df, min_gap = 0.5) {
 }
 
 # ============================================================
+# ★ 후보 간 지표 정규화 + 복합점수 재산출
+# 각 지표를 후보 풀 내에서 min-max 스케일링하여
+# 분산 없는(비구별) 지표의 상수 기여를 제거함
+# → 가중치가 큰 구별 지표가 복합점수를 실제로 주도
+# ============================================================
+normalize_candidate_scores <- function(df, weights) {
+  if (is.null(df) || nrow(df) < 3) return(df)
+
+  metric_cols <- c("cor_score", "mfcc_score", "dtw_freq", "dtw_env",
+                    "band_energy", "harmonic_ratio", "snr")
+  available <- intersect(metric_cols, names(df))
+
+  # 정규화 전 범위 로깅
+  range_strs <- vapply(available, function(mn) {
+    vals <- df[[mn]]
+    sprintf("%s=[%.3f,%.3f]", mn, min(vals, na.rm = TRUE), max(vals, na.rm = TRUE))
+  }, character(1))
+  log_info(sprintf("  ★ 정규화 전 범위: %s", paste(range_strs, collapse = ", ")))
+
+  # 지표별 min-max 정규화
+  norm_data <- list()
+  for (mn in available) {
+    vals <- df[[mn]]
+    vmin <- min(vals, na.rm = TRUE)
+    vmax <- max(vals, na.rm = TRUE)
+    vrange <- vmax - vmin
+
+    if (vrange > 1e-6) {
+      norm_data[[mn]] <- (vals - vmin) / vrange
+    } else {
+      # 분산 없음 → 0.5 (판별 기여 없음)
+      norm_data[[mn]] <- rep(0.5, length(vals))
+    }
+  }
+
+  # 정규화된 점수로 복합점수 재계산
+  for (j in seq_len(nrow(df))) {
+    scores_list <- lapply(available, function(mn) norm_data[[mn]][j])
+    names(scores_list) <- available
+    df$composite[j] <- round(compute_composite_score(scores_list, weights), 4)
+  }
+
+  log_info(sprintf("  ★ 정규화 후 종합점수: %.3f ~ %.3f (범위 %.3f)",
+    min(df$composite, na.rm = TRUE), max(df$composite, na.rm = TRUE),
+    max(df$composite, na.rm = TRUE) - min(df$composite, na.rm = TRUE)))
+
+  df
+}
+
+# ============================================================
 # ★ 자동 튜닝: 종 음원 자가진단으로 최적 가중치 결정
 # ============================================================
 #' 종 음원 내에서 자가진단을 수행하여 최적 가중치를 자동으로 결정한다.
@@ -1409,6 +1466,20 @@ auto_tune_weights <- function(wav, templates_info) {
     ))
   }
 
+  # ★ 역방향 지표 처리: 양성 평균 ≤ 음성 평균이면 변별력 0
+  # (점수가 높을수록 새소리가 아닌 방향 → 복합점수 압축의 원인)
+  for (mi in seq_along(metric_names)) {
+    if (pos_means[mi] <= neg_means[mi]) {
+      if (disc_power[mi] > 0) {
+        log_info(sprintf(
+          "    ★ %s: 역방향 (양성=%.3f ≤ 음성=%.3f) → 가중치 0",
+          metric_names[mi], pos_means[mi], neg_means[mi]
+        ))
+      }
+      disc_power[mi] <- 0
+    }
+  }
+
   # 7) 변별력을 가중치로 변환 (정규화)
   total_disc <- sum(disc_power)
   if (total_disc < 0.001) {
@@ -1419,10 +1490,8 @@ auto_tune_weights <- function(wav, templates_info) {
     #    한 지표에 가중치가 과도하게 몰리는 것을 방지
     raw_weights <- sqrt(disc_power) / sum(sqrt(disc_power))
 
-    min_w <- 0.05
-    raw_weights <- pmax(raw_weights, min_w)
-    raw_weights <- raw_weights / sum(raw_weights)
-
+    # ★ 최소 가중치 제거: 변별력 없는 지표는 가중치 0
+    # (기존 min_w=0.05가 비구별 지표의 상수 기여를 유발하여 점수 압축)
     optimal_weights <- as.list(raw_weights)
     names(optimal_weights) <- metric_names
   }
@@ -2224,6 +2293,7 @@ sp_name_to_idx <- setNames(
 
 # C5: 템플릿별 독립 평가 후 종 단위 병합
 all_template_results <- list()
+template_weights_map <- list()  # ★ 종별 가중치 보관 (정규화 시 사용)
 
 for (t_idx in seq_along(template_names)) {
   tmpl_name <- template_names[t_idx]
@@ -2277,6 +2347,7 @@ for (t_idx in seq_along(template_names)) {
     if (total_w > 0) sp_weights <- lapply(sp_weights, function(w) w / total_w)
   }
   final_cutoff <- sp_conf$cutoff
+  template_weights_map[[tmpl_name]] <- sp_weights  # ★ 정규화용 가중치 보관
 
   if (is.null(det) || nrow(det) == 0) {
     cat(sprintf("\n  [%s] 후보 0건 → 건너뜀\n", tmpl_name))
@@ -2412,6 +2483,12 @@ for (sp_name in species_names_unique) {
   }
 
   combined <- do.call(rbind, sp_dfs)
+
+  # ★ 후보 간 정규화: 비구별 지표의 상수 기여 제거 → 점수 압축 방지
+  sp_w <- template_weights_map[[sp_tmpl_names[1]]]
+  if (!is.null(sp_w) && nrow(combined) >= 3) {
+    combined <- normalize_candidate_scores(combined, sp_w)
+  }
 
   # 최종 cutoff 적용
   sp_conf <- species_list[[sp_name_to_idx[sp_name]]]
