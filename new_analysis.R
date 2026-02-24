@@ -405,6 +405,47 @@ extract_segment <- function(wav, t_start, t_end) {
   Wave(left = seg_data, samp.rate = sr, bit = wav@bit, pcm = TRUE)
 }
 
+#' 스펙트로그램 상관 유사도 (per-segment corMatch 대용)
+#' corMatch의 핵심 원리(스펙트로그램 간 Pearson 상관)를
+#' 임의 두 세그먼트에 대해 직접 계산한다.
+#' auto-tune에서 cor_score의 변별력을 정확히 측정하기 위해 사용.
+#' @param wav_template 템플릿 Wave
+#' @param wav_segment 후보 구간 Wave
+#' @return -1~1 상관계수 (corMatch와 동일 스케일)
+compute_spectrogram_cor <- function(wav_template, wav_segment) {
+  tryCatch(
+    {
+      sr_t <- wav_template@samp.rate
+      sr_s <- wav_segment@samp.rate
+
+      # 스펙트로그램 파라미터 (corMatch 내부 기본값과 유사하게)
+      wl <- 512
+      ovlp <- 50
+
+      spec_t <- seewave::spectro(wav_template, f = sr_t, wl = wl,
+                                  ovlp = ovlp, plot = FALSE)$amp
+      spec_s <- seewave::spectro(wav_segment, f = sr_s, wl = wl,
+                                  ovlp = ovlp, plot = FALSE)$amp
+
+      if (is.null(spec_t) || is.null(spec_s)) return(0)
+      if (length(spec_t) < 4 || length(spec_s) < 4) return(0)
+
+      # 크기 맞추기: 작은 쪽에 맞춤 (행=주파수빈, 열=시간프레임)
+      n_freq <- min(nrow(spec_t), nrow(spec_s))
+      n_time <- min(ncol(spec_t), ncol(spec_s))
+      spec_t <- spec_t[1:n_freq, 1:n_time]
+      spec_s <- spec_s[1:n_freq, 1:n_time]
+
+      # Pearson 상관 (corMatch와 동일 원리)
+      cor(as.vector(spec_t), as.vector(spec_s))
+    },
+    error = function(e) {
+      log_debug(sprintf("    스펙트로그램 상관 계산 오류: %s", e$message))
+      0
+    }
+  )
+}
+
 #' MFCC 코사인 유사도 계산
 #' @param wav_template 템플릿 Wave
 #' @param wav_segment 후보 구간 Wave
@@ -538,6 +579,8 @@ compute_mfcc_dtw_similarity <- function(wav_template, wav_segment, numcep = 13) 
 }
 
 #' 주파수 궤적(Dominant Frequency Contour) DTW 유사도
+#' dfreq()로 추출한 주파수 컨투어를 [0,1]로 정규화한 뒤 DTW 비교.
+#' 정규화를 통해 절대 주파수(kHz)에 무관하게 "모양"만 비교한다.
 #' @return 0~1 유사도
 compute_freq_contour_dtw <- function(wav_template, wav_segment, f_low, f_high) {
   tryCatch(
@@ -564,6 +607,13 @@ compute_freq_contour_dtw <- function(wav_template, wav_segment, f_low, f_high) {
       freq_t[freq_t == 0] <- NA
       freq_s[freq_s == 0] <- NA
 
+      # 유효 프레임 비율 체크: 대부분 NA이면 신뢰할 수 없음
+      valid_ratio_t <- sum(!is.na(freq_t)) / length(freq_t)
+      valid_ratio_s <- sum(!is.na(freq_s)) / length(freq_s)
+      if (valid_ratio_t < 0.3 || valid_ratio_s < 0.3) {
+        return(0) # 유효 프레임이 30% 미만이면 포기
+      }
+
       # NA 보간 (선형)
       freq_t <- approx(seq_along(freq_t), freq_t, seq_along(freq_t), rule = 2)$y
       freq_s <- approx(seq_along(freq_s), freq_s, seq_along(freq_s), rule = 2)$y
@@ -575,9 +625,20 @@ compute_freq_contour_dtw <- function(wav_template, wav_segment, f_low, f_high) {
         return(0)
       }
 
-      # Sakoe-Chiba: 길이 비율 반영 + fallback
+      # ★ [0,1] 정규화: 종의 주파수 범위 기준으로 스케일링
+      #    dfreq는 kHz 단위를 반환하므로 f_low/f_high도 kHz
+      freq_range <- f_high - f_low
+      if (freq_range < 0.001) freq_range <- 0.001 # 0 나눗셈 방지
+      freq_t <- (freq_t - f_low) / freq_range
+      freq_s <- (freq_s - f_low) / freq_range
+      # 범위 클램핑 (보간으로 약간 벗어날 수 있음)
+      freq_t <- pmax(0, pmin(1, freq_t))
+      freq_s <- pmax(0, pmin(1, freq_s))
+
+      # Sakoe-Chiba: 길이 차이 + 여유분 (의미 있는 제약)
       len_diff <- abs(length(freq_t) - length(freq_s))
-      sc_window <- as.integer(max(length(freq_t), length(freq_s)))
+      max_len <- max(length(freq_t), length(freq_s))
+      sc_window <- as.integer(len_diff + max_len * 0.15)
       alignment <- tryCatch(
         dtw::dtw(freq_t, freq_s,
           step.pattern = dtw::symmetric2,
@@ -601,6 +662,8 @@ compute_freq_contour_dtw <- function(wav_template, wav_segment, f_low, f_high) {
 }
 
 #' 진폭 포락선(Amplitude Envelope) DTW 유사도
+#' 에너지 정규화(L2 norm)를 사용하여 스파이크에 견고하게 비교.
+#' 양쪽 모두 동일한 포인트 수로 리샘플링하여 시간 분해능 일치.
 #' @return 0~1 유사도
 compute_envelope_dtw <- function(wav_template, wav_segment) {
   tryCatch(
@@ -615,24 +678,22 @@ compute_envelope_dtw <- function(wav_template, wav_segment) {
         return(0)
       }
 
-      # 정규화 (0~1)
       env_t <- as.numeric(env_t)
       env_s <- as.numeric(env_s)
-      if (max(env_t) > 0) env_t <- env_t / max(env_t)
-      if (max(env_s) > 0) env_s <- env_s / max(env_s)
 
-      # 해상도가 너무 높으면 다운샘플링 (DTW 속도)
-      max_points <- 500
-      if (length(env_t) > max_points) {
-        env_t <- approx(seq_along(env_t), env_t, n = max_points)$y
-      }
-      if (length(env_s) > max_points) {
-        env_s <- approx(seq_along(env_s), env_s, n = max_points)$y
-      }
+      # ★ 양쪽 모두 동일한 포인트 수로 리샘플링 (시간 분해능 통일)
+      target_points <- 200
+      env_t <- approx(seq_along(env_t), env_t, n = target_points)$y
+      env_s <- approx(seq_along(env_s), env_s, n = target_points)$y
 
-      # Sakoe-Chiba: 길이 비율 반영 + fallback
-      len_diff <- abs(length(env_t) - length(env_s))
-      sc_window <- as.integer(max(length(env_t), length(env_s)))
+      # ★ 에너지 정규화 (L2 norm): 스파이크에 견고, 전체 에너지 분포 보존
+      l2_t <- sqrt(sum(env_t^2))
+      l2_s <- sqrt(sum(env_s^2))
+      if (l2_t > 0) env_t <- env_t / l2_t
+      if (l2_s > 0) env_s <- env_s / l2_s
+
+      # Sakoe-Chiba: 동일 길이이므로 15% 여유 (시간 왜곡 허용 범위)
+      sc_window <- as.integer(target_points * 0.15)
       alignment <- tryCatch(
         dtw::dtw(env_t, env_s,
           step.pattern = dtw::symmetric2,
@@ -714,40 +775,71 @@ compute_composite_score <- function(scores_list, weights) {
 # ============================================================
 # C1: Harmonic Ratio (조화 비율) 함수
 # ============================================================
-#' 신호 내 주기적(조화) 성분 비율
-#' 새소리는 높은 조화비를 가지믰로 소음/바람과의 구분력 향상
+#' 시간 도메인 자기상관 기반 조화 비율 (HNR)
+#' 새소리는 성도(syrinx)의 주기적 진동으로 높은 자기상관을 보이고
+#' 바람/소음 등 비주기 신호는 낮은 자기상관을 보인다.
+#' @param wav_segment 분석할 Wave 객체
+#' @param f_low 종 주파수 하한 (kHz)
+#' @param f_high 종 주파수 상한 (kHz)
+#' @return 0~1 조화 비율 (높을수록 주기적/조화적)
 compute_harmonic_ratio <- function(wav_segment, f_low, f_high) {
   tryCatch(
     {
       sr <- wav_segment@samp.rate
-      spec <- meanspec(wav_segment, f = sr, plot = FALSE)
-      if (is.null(spec) || nrow(spec) < 10) {
+
+      # 1) 종의 주파수 대역으로 밴드패스 필터링
+      bp_from <- f_low * 1000 # kHz → Hz
+      bp_to <- min(f_high * 1000, sr / 2 - 1) # 나이퀴스트 이하로 제한
+      if (bp_from >= bp_to || bp_from < 1) {
+        return(0)
+      }
+      filtered <- seewave::ffilter(wav_segment, f = sr,
+                                    from = bp_from, to = bp_to)
+
+      # 2) 필터링된 시간 도메인 신호 추출
+      sig <- filtered@left
+      if (length(sig) < sr * 0.01) { # 최소 10ms
         return(0)
       }
 
-      # 대역 내 스펙트럼만 추출
-      freqs <- spec[, 1] # kHz
-      amps <- spec[, 2]
-      in_band <- freqs >= f_low & freqs <= f_high
-      band_spec <- amps[in_band]
+      # 3) 시간 도메인 자기상관 — 기본 주파수 범위의 lag를 탐색
+      #    f_high에 해당하는 최소 주기 ~ f_low에 해당하는 최대 주기
+      min_lag <- as.integer(sr / (f_high * 1000)) # 최고 주파수의 주기 (샘플)
+      max_lag <- as.integer(sr / (f_low * 1000))  # 최저 주파수의 주기 (샘플)
+      min_lag <- max(1, min_lag)
+      max_lag <- min(max_lag, length(sig) %/% 2)
 
-      if (length(band_spec) < 5) {
+      if (min_lag >= max_lag) {
         return(0)
       }
 
-      # 자기상관으로 주기성 측정
-      acf_vals <- acf(band_spec,
-        lag.max = length(band_spec) %/% 2,
-        plot = FALSE
-      )$acf
-      # 첫 번째 양의 피크 (기본 주파수 후보)
-      peaks <- which(diff(sign(diff(as.numeric(acf_vals)))) == -2) + 1
+      acf_result <- acf(sig, lag.max = max_lag, plot = FALSE)
+      acf_vals <- as.numeric(acf_result$acf)
+
+      # 4) 관심 lag 범위(min_lag ~ max_lag)에서 최대 피크 찾기
+      #    lag 인덱스는 1-based이므로 lag=k는 acf_vals[k+1]
+      search_start <- min_lag + 1 # +1: acf_vals[1]은 lag=0
+      search_end <- min(max_lag + 1, length(acf_vals))
+
+      if (search_start >= search_end) {
+        return(0)
+      }
+
+      search_region <- acf_vals[search_start:search_end]
+
+      # 피크 검출: 양쪽보다 큰 지점
+      if (length(search_region) < 3) {
+        return(max(0, max(search_region)))
+      }
+      peaks <- which(diff(sign(diff(search_region))) == -2) + 1
       if (length(peaks) == 0) {
-        return(0)
+        # 피크 없으면 구간 내 최댓값 사용
+        return(max(0, max(search_region)))
       }
 
-      # 가장 큰 피크의 자기상관 강도 → 조화 비율
-      max(0, acf_vals[peaks[1]])
+      # 5) 최대 ACF 피크 값 = 조화 비율
+      peak_vals <- search_region[peaks]
+      max(0, max(peak_vals))
     },
     error = function(e) {
       log_debug(sprintf("    HR 계산 오류: %s", e$message))
@@ -992,8 +1084,8 @@ auto_tune_weights <- function(wav, templates_info) {
     scores <- tryCatch(
       {
         s <- list()
-        mfcc_cos <- compute_mfcc_similarity(ref_seg, seg)
-        s$cor_score <- mfcc_cos
+        # ★ cor_score: 스펙트로그램 상관 (분석 모드의 corMatch와 동일 원리)
+        s$cor_score <- compute_spectrogram_cor(ref_seg, seg)
         s$mfcc_score <- compute_mfcc_dtw_similarity(ref_seg, seg)
         s$dtw_freq <- compute_freq_contour_dtw(ref_seg, seg, f_low, f_high)
         s$dtw_env <- compute_envelope_dtw(ref_seg, seg)
