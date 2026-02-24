@@ -37,7 +37,7 @@ DEFAULT_WEIGHTS <- list(
   dtw_env        = 0.08, # 진폭 포락선 DTW
   band_energy    = 0.13, # 주파수 대역 에너지 집중도
   harmonic_ratio = 0.18, # C1: 조화 비율 (새소리 주기성)
-  snr            = 0.12  # C1.5: 신호 대 잡음비
+  snr            = 0.12 # C1.5: 신호 대 잡음비
 )
 
 # 1단계 후보 검출용 넓은 cutoff (본래 cutoff의 이 비율)
@@ -423,13 +423,21 @@ compute_spectrogram_cor <- function(wav_template, wav_segment) {
       wl <- 512
       ovlp <- 50
 
-      spec_t <- seewave::spectro(wav_template, f = sr_t, wl = wl,
-                                  ovlp = ovlp, plot = FALSE)$amp
-      spec_s <- seewave::spectro(wav_segment, f = sr_s, wl = wl,
-                                  ovlp = ovlp, plot = FALSE)$amp
+      spec_t <- seewave::spectro(wav_template,
+        f = sr_t, wl = wl,
+        ovlp = ovlp, plot = FALSE
+      )$amp
+      spec_s <- seewave::spectro(wav_segment,
+        f = sr_s, wl = wl,
+        ovlp = ovlp, plot = FALSE
+      )$amp
 
-      if (is.null(spec_t) || is.null(spec_s)) return(0)
-      if (length(spec_t) < 4 || length(spec_s) < 4) return(0)
+      if (is.null(spec_t) || is.null(spec_s)) {
+        return(0)
+      }
+      if (length(spec_t) < 4 || length(spec_s) < 4) {
+        return(0)
+      }
 
       # 크기 맞추기: 작은 쪽에 맞춤 (행=주파수빈, 열=시간프레임)
       n_freq <- min(nrow(spec_t), nrow(spec_s))
@@ -458,10 +466,14 @@ compute_mfcc_similarity <- function(wav_template, wav_segment, numcep = 13) {
       sr_t <- wav_template@samp.rate
       sr_s <- wav_segment@samp.rate
 
-      mfcc_t <- tuneR::melfcc(wav_template, sr = sr_t, numcep = numcep,
-                              wintime = 0.025, hoptime = 0.010)
-      mfcc_s <- tuneR::melfcc(wav_segment, sr = sr_s, numcep = numcep,
-                              wintime = 0.025, hoptime = 0.010)
+      mfcc_t <- tuneR::melfcc(wav_template,
+        sr = sr_t, numcep = numcep,
+        wintime = 0.025, hoptime = 0.010
+      )
+      mfcc_s <- tuneR::melfcc(wav_segment,
+        sr = sr_s, numcep = numcep,
+        wintime = 0.025, hoptime = 0.010
+      )
 
       if (is.null(mfcc_t) || is.null(mfcc_s)) {
         return(0)
@@ -502,16 +514,22 @@ compute_mfcc_dtw_similarity <- function(wav_template, wav_segment, numcep = 13) 
       sr_t <- wav_template@samp.rate
       sr_s <- wav_segment@samp.rate
 
-      mfcc_t <- tuneR::melfcc(wav_template, sr = sr_t, numcep = numcep,
-                              wintime = 0.025, hoptime = 0.010)
-      mfcc_s <- tuneR::melfcc(wav_segment, sr = sr_s, numcep = numcep,
-                              wintime = 0.025, hoptime = 0.010)
+      mfcc_t <- tuneR::melfcc(wav_template,
+        sr = sr_t, numcep = numcep,
+        wintime = 0.025, hoptime = 0.010
+      )
+      mfcc_s <- tuneR::melfcc(wav_segment,
+        sr = sr_s, numcep = numcep,
+        wintime = 0.025, hoptime = 0.010
+      )
 
       if (is.null(mfcc_t) || is.null(mfcc_s) ||
-          nrow(mfcc_t) < 3 || nrow(mfcc_s) < 3) {
-        log_info(sprintf("    ⚠ MFCC-DTW: 프레임 부족 (t=%s, s=%s)",
-                         if(is.null(mfcc_t)) "NULL" else nrow(mfcc_t),
-                         if(is.null(mfcc_s)) "NULL" else nrow(mfcc_s)))
+        nrow(mfcc_t) < 3 || nrow(mfcc_s) < 3) {
+        log_info(sprintf(
+          "    ⚠ MFCC-DTW: 프레임 부족 (t=%s, s=%s)",
+          if (is.null(mfcc_t)) "NULL" else nrow(mfcc_t),
+          if (is.null(mfcc_s)) "NULL" else nrow(mfcc_s)
+        ))
         return(0)
       }
 
@@ -556,8 +574,10 @@ compute_mfcc_dtw_similarity <- function(wav_template, wav_segment, numcep = 13) 
       )
 
       if (is.null(alignment)) {
-        log_info(sprintf("    ⚠ MFCC-DTW: DTW 정렬 실패 (행렬 %dx%d)",
-                         nrow(cos_dist_matrix), ncol(cos_dist_matrix)))
+        log_info(sprintf(
+          "    ⚠ MFCC-DTW: DTW 정렬 실패 (행렬 %dx%d)",
+          nrow(cos_dist_matrix), ncol(cos_dist_matrix)
+        ))
         return(0)
       }
 
@@ -567,8 +587,10 @@ compute_mfcc_dtw_similarity <- function(wav_template, wav_segment, numcep = 13) 
       # exp(-DTW_ALPHA * nd)로 매핑: nd=0→1.0, nd=0.3→0.55, nd=1→0.14
       score <- exp(-DTW_ALPHA * nd)
 
-      log_debug(sprintf("    MFCC-DTW: frames_t=%d, frames_s=%d, cosDist=%.3f, score=%.4f",
-                        nrow(mfcc_t), nrow(mfcc_s), nd, score))
+      log_debug(sprintf(
+        "    MFCC-DTW: frames_t=%d, frames_s=%d, cosDist=%.3f, score=%.4f",
+        nrow(mfcc_t), nrow(mfcc_s), nd, score
+      ))
 
       score
     },
@@ -810,8 +832,11 @@ compute_harmonic_ratio <- function(wav_segment, f_low, f_high) {
       if (bp_from >= bp_to || bp_from < 1) {
         return(0)
       }
-      filtered <- seewave::ffilter(wav_segment, f = sr,
-                                    from = bp_from, to = bp_to)
+      filtered <- seewave::ffilter(wav_segment,
+        f = sr,
+        from = bp_from, to = bp_to,
+        output = "Wave"
+      ) # ★ 필수! 없으면 matrix 반환 → @left 오류
 
       # 2) 필터링된 시간 도메인 신호 추출
       sig <- filtered@left
@@ -822,7 +847,7 @@ compute_harmonic_ratio <- function(wav_segment, f_low, f_high) {
       # 3) 시간 도메인 자기상관 — 기본 주파수 범위의 lag를 탐색
       #    f_high에 해당하는 최소 주기 ~ f_low에 해당하는 최대 주기
       min_lag <- as.integer(sr / (f_high * 1000)) # 최고 주파수의 주기 (샘플)
-      max_lag <- as.integer(sr / (f_low * 1000))  # 최저 주파수의 주기 (샘플)
+      max_lag <- as.integer(sr / (f_low * 1000)) # 최저 주파수의 주기 (샘플)
       min_lag <- max(1, min_lag)
       max_lag <- min(max_lag, length(sig) %/% 2)
 
@@ -901,7 +926,9 @@ compute_snr_ratio <- function(wav_segment, f_low, f_high) {
       # (bin 수로 정규화하여 대역 너비에 무관하게)
       n_in <- sum(in_band)
       n_out <- sum(!in_band)
-      if (n_in == 0 || n_out == 0) return(0)
+      if (n_in == 0 || n_out == 0) {
+        return(0)
+      }
 
       mean_signal <- signal_power / n_in
       mean_noise <- noise_power / n_out
@@ -1128,12 +1155,12 @@ auto_tune_weights <- function(wav, templates_info) {
   min_neg_required <- 10
   neg_factor <- 0.7 # 시작: sim_threshold * 0.7
   neg_indices <- which(window_max_sims < sim_threshold * neg_factor &
-                        window_max_sims < 1.0) # sim=1.0 (템플릿 겹침) 제외
+    window_max_sims < 1.0) # sim=1.0 (템플릿 겹침) 제외
 
   while (length(neg_indices) < min_neg_required && neg_factor < 0.95) {
     neg_factor <- neg_factor + 0.05
     neg_indices <- which(window_max_sims < sim_threshold * neg_factor &
-                          window_max_sims < 1.0)
+      window_max_sims < 1.0)
   }
 
   # 여전히 부족하면: 유사도 하위 N개를 강제 음성으로 사용
@@ -1145,11 +1172,15 @@ auto_tune_weights <- function(wav, templates_info) {
     } else if (length(non_template_indices) > 0) {
       neg_indices <- non_template_indices
     }
-    log_info(sprintf("  ⚠ 음성 부족 → 유사도 하위 %d개 강제 사용 (factor=%.2f)",
-                     length(neg_indices), neg_factor))
+    log_info(sprintf(
+      "  ⚠ 음성 부족 → 유사도 하위 %d개 강제 사용 (factor=%.2f)",
+      length(neg_indices), neg_factor
+    ))
   } else {
-    log_info(sprintf("  음성 임계값: sim < %.3f (factor=%.2f, %d건)",
-                     sim_threshold * neg_factor, neg_factor, length(neg_indices)))
+    log_info(sprintf(
+      "  음성 임계값: sim < %.3f (factor=%.2f, %d건)",
+      sim_threshold * neg_factor, neg_factor, length(neg_indices)
+    ))
   }
 
   # 유사도 기준 정렬 후 균등 간격 서브샘플링
@@ -2363,7 +2394,8 @@ for (sp_name in species_names_unique) {
   # passed 마킹 (NA composite → FALSE)
   if (nrow(combined) > 0) {
     combined$passed <- ifelse(is.na(combined$composite), FALSE,
-                              combined$composite >= final_cutoff)
+      combined$composite >= final_cutoff
+    )
   }
 
   # C2 + C5: NMS 병합 (멀티 템플릿 간 중복도 제거)
