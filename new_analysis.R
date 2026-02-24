@@ -391,10 +391,13 @@ print_section <- function(title, subtitle = NULL) {
 #' @param t_end 종료 시간 (초)
 #' @return Wave 객체
 extract_segment <- function(wav, t_start, t_end) {
+  if (is.na(t_start) || is.na(t_end) || is.null(t_start) || is.null(t_end)) {
+    return(NULL)
+  }
   sr <- wav@samp.rate
   s1 <- max(1, round(t_start * sr))
   s2 <- min(length(wav@left), round(t_end * sr))
-  if (s2 <= s1) {
+  if (is.na(s1) || is.na(s2) || s2 <= s1) {
     return(NULL)
   }
 
@@ -410,8 +413,13 @@ extract_segment <- function(wav, t_start, t_end) {
 compute_mfcc_similarity <- function(wav_template, wav_segment, numcep = 13) {
   tryCatch(
     {
-      mfcc_t <- melfcc(wav_template, numcep = numcep, wintime = 0.025, hoptime = 0.010)
-      mfcc_s <- melfcc(wav_segment, numcep = numcep, wintime = 0.025, hoptime = 0.010)
+      sr_t <- wav_template@samp.rate
+      sr_s <- wav_segment@samp.rate
+
+      mfcc_t <- tuneR::melfcc(wav_template, sr = sr_t, numcep = numcep,
+                              wintime = 0.025, hoptime = 0.010)
+      mfcc_s <- tuneR::melfcc(wav_segment, sr = sr_s, numcep = numcep,
+                              wintime = 0.025, hoptime = 0.010)
 
       if (is.null(mfcc_t) || is.null(mfcc_s)) {
         return(0)
@@ -438,7 +446,7 @@ compute_mfcc_similarity <- function(wav_template, wav_segment, numcep = 13) {
       max(0, (sim + 1) / 2)
     },
     error = function(e) {
-      log_debug(sprintf("    MFCC 계산 오류: %s", e$message))
+      log_info(sprintf("    ⚠ MFCC 코사인 유사도 계산 오류: %s", e$message))
       0
     }
   )
@@ -449,37 +457,81 @@ compute_mfcc_similarity <- function(wav_template, wav_segment, numcep = 13) {
 compute_mfcc_dtw_similarity <- function(wav_template, wav_segment, numcep = 13) {
   tryCatch(
     {
-      mfcc_t <- melfcc(wav_template, numcep = numcep, wintime = 0.025, hoptime = 0.010)
-      mfcc_s <- melfcc(wav_segment, numcep = numcep, wintime = 0.025, hoptime = 0.010)
+      sr_t <- wav_template@samp.rate
+      sr_s <- wav_segment@samp.rate
 
-      if (nrow(mfcc_t) < 3 || nrow(mfcc_s) < 3) {
+      mfcc_t <- tuneR::melfcc(wav_template, sr = sr_t, numcep = numcep,
+                              wintime = 0.025, hoptime = 0.010)
+      mfcc_s <- tuneR::melfcc(wav_segment, sr = sr_s, numcep = numcep,
+                              wintime = 0.025, hoptime = 0.010)
+
+      if (is.null(mfcc_t) || is.null(mfcc_s) ||
+          nrow(mfcc_t) < 3 || nrow(mfcc_s) < 3) {
+        log_info(sprintf("    ⚠ MFCC-DTW: 프레임 부족 (t=%s, s=%s)",
+                         if(is.null(mfcc_t)) "NULL" else nrow(mfcc_t),
+                         if(is.null(mfcc_s)) "NULL" else nrow(mfcc_s)))
         return(0)
       }
 
-      # Sakoe-Chiba 창: 길이 비율 반영 + 충분한 여유
-      len_diff <- abs(nrow(mfcc_t) - nrow(mfcc_s))
-      sc_window <- as.integer(max(nrow(mfcc_t), nrow(mfcc_s)))
+      # ★ 코사인 거리 행렬 계산 (스케일 무관, 0~2 범위)
+      # Euclidean은 차원 수에 비례하여 거리가 커지지만
+      # 코사인 거리는 차원에 무관하게 0(동일)~2(반대) 범위
+      norm_t <- sqrt(rowSums(mfcc_t^2))
+      norm_s <- sqrt(rowSums(mfcc_s^2))
+      # 0-벡터 보호
+      norm_t[norm_t < 1e-10] <- 1
+      norm_s[norm_s < 1e-10] <- 1
+      mfcc_t_unit <- mfcc_t / norm_t
+      mfcc_s_unit <- mfcc_s / norm_s
+
+      # 코사인 거리 행렬: 1 - cosine_similarity (0~2)
+      cos_sim_matrix <- tcrossprod(mfcc_t_unit, mfcc_s_unit)
+      cos_dist_matrix <- 1 - cos_sim_matrix
+
+      # ★ NaN/Inf 보호: 수치 불안정으로 생긴 NaN을 1.0(무관)으로 대체
+      cos_dist_matrix[is.nan(cos_dist_matrix)] <- 1.0
+      cos_dist_matrix[is.infinite(cos_dist_matrix)] <- 2.0
+      # 음수 거리 방지 (부동소수점 오차)
+      cos_dist_matrix[cos_dist_matrix < 0] <- 0.0
+
+      # DTW — 제약 없이 실행 (프레임 길이 차이가 클 수 있으므로)
       alignment <- tryCatch(
-        dtw::dtw(mfcc_t, mfcc_s,
-          dist.method = "Euclidean",
+        dtw::dtw(cos_dist_matrix,
           step.pattern = dtw::symmetric2,
-          window.type = "sakoechiba",
-          window.size = sc_window
+          window.type = "none"
         ),
         error = function(e) {
-          # fallback: 제약 없이 실행
-          dtw::dtw(mfcc_t, mfcc_s,
-            dist.method = "Euclidean",
-            step.pattern = dtw::symmetric2,
-            window.type = "none"
+          log_debug(sprintf("    MFCC-DTW fallback 시도: %s", e$message))
+          # 최후 수단: asymmetric step pattern
+          tryCatch(
+            dtw::dtw(cos_dist_matrix,
+              step.pattern = dtw::asymmetric,
+              window.type = "none"
+            ),
+            error = function(e2) NULL
           )
         }
       )
 
-      exp(-DTW_ALPHA * alignment$normalizedDistance)
+      if (is.null(alignment)) {
+        log_info(sprintf("    ⚠ MFCC-DTW: DTW 정렬 실패 (행렬 %dx%d)",
+                         nrow(cos_dist_matrix), ncol(cos_dist_matrix)))
+        return(0)
+      }
+
+      nd <- alignment$normalizedDistance
+
+      # 코사인 거리의 normalizedDistance: 동일=0, 무관=~1, 반대=~2
+      # exp(-DTW_ALPHA * nd)로 매핑: nd=0→1.0, nd=0.3→0.55, nd=1→0.14
+      score <- exp(-DTW_ALPHA * nd)
+
+      log_debug(sprintf("    MFCC-DTW: frames_t=%d, frames_s=%d, cosDist=%.3f, score=%.4f",
+                        nrow(mfcc_t), nrow(mfcc_s), nd, score))
+
+      score
     },
     error = function(e) {
-      log_debug(sprintf("    MFCC-DTW 계산 오류: %s", e$message))
+      log_info(sprintf("    ⚠ MFCC-DTW 계산 오류: %s", e$message))
       0
     }
   )
@@ -497,11 +549,11 @@ compute_freq_contour_dtw <- function(wav_template, wav_segment, f_low, f_high) {
       bp_high <- f_high * 1000
 
       # dominant frequency 추출
-      df_t <- dfreq(wav_template,
+      df_t <- seewave::dfreq(wav_template,
         f = sr, bandpass = c(bp_low, bp_high),
         ovlp = 50, threshold = 5, plot = FALSE
       )
-      df_s <- dfreq(wav_segment,
+      df_s <- seewave::dfreq(wav_segment,
         f = sr, bandpass = c(bp_low, bp_high),
         ovlp = 50, threshold = 5, plot = FALSE
       )
@@ -708,6 +760,9 @@ compute_harmonic_ratio <- function(wav_segment, f_low, f_high) {
 # ============================================================
 #' 근접 검출 병합: min_gap(초) 이내의 검출 중 최고 점수만 유지
 nms_detections <- function(df, min_gap = 0.5) {
+  # NA 제거 (time 또는 composite가 NA인 행)
+  df <- df[!is.na(df$time) & !is.na(df$composite), , drop = FALSE]
+
   if (nrow(df) <= 1) {
     return(df)
   }
@@ -1258,14 +1313,14 @@ if (run_mode == "spectrogram") {
 
 
   # 새 파라미터: dB 범위, DPI, 표시 요소 토글
-  dB_min     <- if (!is.null(config$dB_min)) config$dB_min else -60
-  dB_max     <- if (!is.null(config$dB_max)) config$dB_max else 0
-  img_res    <- if (!is.null(config$res))    config$res    else 150
+  dB_min <- if (!is.null(config$dB_min)) config$dB_min else -60
+  dB_max <- if (!is.null(config$dB_max)) config$dB_max else 0
+  img_res <- if (!is.null(config$res)) config$res else 150
   show_title <- if (!is.null(config$show_title)) config$show_title else TRUE
   show_scale <- if (!is.null(config$show_scale)) config$show_scale else TRUE
-  show_osc   <- if (!is.null(config$show_osc))   config$show_osc   else FALSE
-  show_det   <- if (!is.null(config$show_detections)) config$show_detections else TRUE
-  det_cex    <- if (!is.null(config$det_cex)) config$det_cex else 0.7
+  show_osc <- if (!is.null(config$show_osc)) config$show_osc else FALSE
+  show_det <- if (!is.null(config$show_detections)) config$show_detections else TRUE
+  det_cex <- if (!is.null(config$det_cex)) config$det_cex else 0.7
 
   # 검출 결과 오버레이 (show_det가 FALSE이면 비활성)
   det_list <- if (isTRUE(show_det)) config$detections else NULL
@@ -1799,14 +1854,15 @@ print_section(
   "2단계: 종합 판별 (Composite Scoring)",
   c(
     sprintf(
-      "가중치: cor=%.0f%%, mfcc=%.0f%%, dtw_freq=%.0f%%, dtw_env=%.0f%%, band=%.0f%%",
+      "가중치: cor=%.0f%%, mfcc=%.0f%%, dtw_freq=%.0f%%, dtw_env=%.0f%%, band=%.0f%%, hr=%.0f%%",
       global_weights$cor_score * 100,
       global_weights$mfcc_score * 100,
       global_weights$dtw_freq * 100,
       global_weights$dtw_env * 100,
-      global_weights$band_energy * 100
+      global_weights$band_energy * 100,
+      global_weights$harmonic_ratio * 100
     ),
-    "각 후보 구간에 대해 5가지 지표를 종합 평가합니다."
+    "각 후보 구간에 대해 6가지 지표를 종합 평가합니다."
   )
 )
 
@@ -1847,15 +1903,18 @@ for (t_idx in seq_along(template_names)) {
     )
     if (!is.null(sp_wav_for_tune)) {
       log_info(sprintf("  [%s] 자동 가중치 튜닝 중...", sp_name))
-      tune_res <- auto_tune_weights(
-        sp_wav_for_tune, first_tmpl$t_start, first_tmpl$t_end,
-        ref_freq$f_low, ref_freq$f_high
-      )
+      # templates_info 리스트 구성 (auto_tune_weights 시그니처에 맞춤)
+      tune_templates_info <- list(list(
+        t_start = first_tmpl$t_start, t_end = first_tmpl$t_end,
+        f_low = ref_freq$f_low, f_high = ref_freq$f_high
+      ))
+      tune_res <- auto_tune_weights(sp_wav_for_tune, tune_templates_info)
       sp_weights <- tune_res$weights
       log_info(sprintf(
-        "  [%s] 자동 가중치: cor=%.3f mfcc=%.3f freq=%.3f env=%.3f band=%.3f",
+        "  [%s] 자동 가중치: cor=%.3f mfcc=%.3f freq=%.3f env=%.3f band=%.3f hr=%.3f",
         sp_name, sp_weights$cor_score, sp_weights$mfcc_score,
-        sp_weights$dtw_freq, sp_weights$dtw_env, sp_weights$band_energy
+        sp_weights$dtw_freq, sp_weights$dtw_env, sp_weights$band_energy,
+        sp_weights$harmonic_ratio
       ))
     } else {
       sp_weights <- if (!is.null(sp_conf$weights)) sp_conf$weights else global_weights
@@ -2004,30 +2063,37 @@ for (sp_name in species_names_unique) {
   ))
 
   # 진단
-  if (nrow(sp_df_pass) == 0 && nrow(combined) > 0) {
-    best <- combined[which.max(combined$composite), ]
-    cat(sprintf("    ** 검출 없음. 최고 종합점수: %.4f (t=%.1f)\n", best$composite, best$time))
-    cat(sprintf(
-      "       내역: cor=%.3f, mfcc=%.3f, freq=%.3f, env=%.3f, band=%.3f, hr=%.3f\n",
-      best$cor_score, best$mfcc_score, best$dtw_freq, best$dtw_env,
-      best$band_energy, best$harmonic_ratio
-    ))
-    if (best$composite > final_cutoff * 0.7) {
+  n_valid <- sum(!is.na(combined$composite))
+  if (nrow(sp_df_pass) == 0 && n_valid > 0) {
+    best_idx <- which.max(combined$composite)
+    if (length(best_idx) > 0) {
+      best <- combined[best_idx, ]
+      cat(sprintf("    ** 검출 없음. 최고 종합점수: %.4f (t=%.1f)\n", best$composite, best$time))
       cat(sprintf(
-        "    [제안] cutoff를 %.2f로 낮추면 검출될 수 있습니다.\n",
-        best$composite * 0.9
+        "       내역: cor=%.3f, mfcc=%.3f, freq=%.3f, env=%.3f, band=%.3f, hr=%.3f\n",
+        best$cor_score, best$mfcc_score, best$dtw_freq, best$dtw_env,
+        best$band_energy, best$harmonic_ratio
       ))
+      if (best$composite > final_cutoff * 0.7) {
+        cat(sprintf(
+          "    [제안] cutoff를 %.2f로 낮추면 검출될 수 있습니다.\n",
+          best$composite * 0.9
+        ))
+      }
     }
+  } else if (n_valid == 0 && nrow(combined) > 0) {
+    cat("    ** 모든 후보의 종합점수가 NA입니다.\n")
   }
 
-  # passed 마킹
+  # passed 마킹 (NA composite → FALSE)
   if (nrow(combined) > 0) {
-    combined$passed <- combined$composite >= final_cutoff
+    combined$passed <- ifelse(is.na(combined$composite), FALSE,
+                              combined$composite >= final_cutoff)
   }
 
   # C2 + C5: NMS 병합 (멀티 템플릿 간 중복도 제거)
-  n_before_nms <- sum(combined$passed)
-  if (n_before_nms > 1) {
+  n_before_nms <- sum(combined$passed, na.rm = TRUE)
+  if (isTRUE(n_before_nms > 1)) {
     sp_df_pass_only <- combined[combined$passed == TRUE, , drop = FALSE]
     nms_gap <- if (!is.null(sp_conf$nms_gap)) sp_conf$nms_gap else 0.5
     sp_df_pass_nms <- nms_detections(sp_df_pass_only, min_gap = nms_gap)
@@ -2183,6 +2249,10 @@ tryCatch(
       df <- final_results[[sp_name]]
       if (is.null(df) || nrow(df) == 0) next
 
+      # NA 행 제거 (time 또는 composite가 NA인 행은 플롯 불가)
+      df <- df[!is.na(df$time) & !is.na(df$composite), , drop = FALSE]
+      if (nrow(df) == 0) next
+
       png_path <- file.path(output_dir, paste0("composite_", sp_name, ".png"))
       png(png_path, width = 1000, height = 500)
       par(mar = c(5, 4, 3, 2))
@@ -2194,10 +2264,10 @@ tryCatch(
         col = ifelse(df$composite >= cutoff_val, "darkgreen", "gray70"),
         main = sprintf("%s - 종합 판별 점수", sp_name),
         xlab = "시간 (초)", ylab = "종합 점수",
-        ylim = c(0, max(1, max(df$composite) * 1.1))
+        ylim = c(0, max(1, max(df$composite, na.rm = TRUE) * 1.1))
       )
       abline(h = cutoff_val, col = "red", lty = 2, lwd = 2)
-      text(min(df$time), cutoff_val + 0.03,
+      text(min(df$time, na.rm = TRUE), cutoff_val + 0.03,
         sprintf("cutoff = %.3f", cutoff_val),
         col = "red", adj = 0
       )
@@ -2229,11 +2299,11 @@ total_detections <- 0
 for (sp_name in species_names_unique) {
   df <- final_results[[sp_name]]
   n_total <- if (!is.null(df)) nrow(df) else 0
-  n_pass <- if (!is.null(df)) sum(df$passed) else 0
+  n_pass <- if (!is.null(df)) sum(df$passed, na.rm = TRUE) else 0
   total_detections <- total_detections + n_pass
   cat(sprintf("  %s: 후보 %d건 → 최종 %d건 검출\n", sp_name, n_total, n_pass))
 
-  if (n_pass > 0) {
+  if (isTRUE(n_pass > 0)) {
     df_pass <- df[df$passed == TRUE, ]
     cat(sprintf(
       "    종합점수: %.3f ~ %.3f (평균 %.3f)\n",

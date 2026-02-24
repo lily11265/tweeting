@@ -33,6 +33,9 @@ from audio.playback import (
     prepare_playback_wav, HAS_PLAYBACK,
 )
 
+# 오디오 필터 (밴드패스, 폴리곤 마스킹)
+from audio.audio_filter import prepare_filtered_wav, prepare_polygon_wav
+
 # 모듈 내 참조
 from colormaps import COLORMAPS, MAGMA_LUT, DETECTION_COLORS
 
@@ -104,6 +107,13 @@ class SpectrogramTab:
         self._play_temp_wav = None    # 임시 WAV 파일 경로
         self._play_generation = 0     # 재생 세대 카운터 (스레드 경합 방지)
 
+        # ── 박스/폴리곤 선택 상태 ──
+        self._box_sel_start = None    # Shift+드래그 박스 시작 (px_x, px_y)
+        self._box_sel_rect = None     # 캔버스 사각형 ID
+        self._poly_points = []        # Ctrl+클릭 폴리곤 꼭짓점 (데이터 좌표)
+        self._poly_canvas_ids = []    # 폴리곤 캔버스 아이템 IDs
+        self._poly_snap_dist = 15     # 시작점 스냅 거리 (px)
+
         self._build_ui()
 
         # WAV 로드를 백그라운드 스레드에서 실행
@@ -150,7 +160,7 @@ class SpectrogramTab:
         ttk.Button(toolbar, text="📐 전체 보기", width=10,
                    command=self._reset_view).pack(side="right", padx=5)
 
-        ttk.Label(toolbar, text="  휠: 확대/축소 | Shift+휠: 좌우 | Ctrl+휠: 상하 | 드래그: 이동  ",
+        ttk.Label(toolbar, text="  휠: 줌 | 드래그: 이동 | Shift+드래그: 📦박스재생 | Ctrl+클릭: ✏폴리곤재생  ",
                   foreground="gray").pack(side="right")
 
         # ---- 툴바 2행: 색상 조절 ----
@@ -286,6 +296,9 @@ class SpectrogramTab:
         self.canvas.bind("<B1-Motion>", self._on_drag_move)
         self.canvas.bind("<ButtonRelease-1>", self._on_drag_end)
         self.canvas.bind("<Configure>", self._on_resize)
+        # 폴리곤 취소 (우클릭 또는 Escape)
+        self.canvas.bind("<ButtonPress-3>", lambda e: self._cancel_polygon())
+        self.canvas.bind("<Escape>", lambda e: self._cancel_polygon())
 
     # ---- 렌더링 (백그라운드 스레드) ----
     def _render(self):
@@ -640,7 +653,37 @@ class SpectrogramTab:
         # 정밀 렌더링은 디바운스로 예약
         self._schedule_render(200)
 
+    def _px_to_data(self, px_x, px_y):
+        """캔버스 픽셀 → (시간, 주파수) 데이터 좌표"""
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
+        t = self.t_start + (px_x / cw) * (self.t_end - self.t_start)
+        f = self.f_high - (px_y / ch) * (self.f_high - self.f_low)
+        return t, f
+
+    def _data_to_px(self, t, f):
+        """(시간, 주파수) 데이터 좌표 → 캔버스 픽셀"""
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
+        px_x = (t - self.t_start) / max(self.t_end - self.t_start, 0.001) * cw
+        px_y = (self.f_high - f) / max(self.f_high - self.f_low, 1) * ch
+        return px_x, px_y
+
     def _on_drag_start(self, event):
+        shift = bool(event.state & 0x0001)
+        ctrl = bool(event.state & 0x0004)
+
+        # Ctrl+클릭 → 폴리곤 점 추가
+        if ctrl:
+            self._on_polygon_click(event)
+            return
+
+        # Shift+드래그 → 박스 선택 모드
+        if shift:
+            self._box_sel_start = (event.x, event.y)
+            self._clear_box_overlay()
+            return
+
         # 재생 중 클릭 → 해당 시점으로 탐색
         if self._playing:
             cw = max(self.canvas.winfo_width(), 1)
@@ -664,6 +707,11 @@ class SpectrogramTab:
                 self._drag_img_origin = (coords[0], coords[1])
 
     def _on_drag_move(self, event):
+        # 박스 선택 모드
+        if self._box_sel_start:
+            self._update_box_overlay(event.x, event.y)
+            return
+
         if not self._drag_start or not self._drag_view:
             return
 
@@ -702,10 +750,191 @@ class SpectrogramTab:
         self._schedule_render(250)
 
     def _on_drag_end(self, event):
+        # 박스 선택 완료 → 필터 재생
+        if self._box_sel_start:
+            sx, sy = self._box_sel_start
+            self._box_sel_start = None
+            t0, f0 = self._px_to_data(min(sx, event.x), min(sy, event.y))
+            t1, f1 = self._px_to_data(max(sx, event.x), max(sy, event.y))
+            # f 좌표 정렬 (캔버스 Y축과 주파수 축이 반대)
+            f_low = min(f0, f1)
+            f_high = max(f0, f1)
+            t0 = max(0, t0)
+            t1 = min(self.duration, t1)
+            if t1 - t0 > 0.01 and f_high - f_low > 10:
+                self._play_filtered_box(t0, t1, f_low, f_high)
+            return
+
         self._drag_start = None
         self._drag_view = None
         # 드래그 종료 시 즉시 정밀 렌더링
         self._schedule_render(0)
+
+    # ── 박스 선택 오버레이 ──
+
+    def _update_box_overlay(self, cx, cy):
+        """Shift+드래그 중 박스 오버레이 갱신"""
+        sx, sy = self._box_sel_start
+        self._clear_box_overlay()
+        self._box_sel_rect = self.canvas.create_rectangle(
+            sx, sy, cx, cy,
+            outline="#00BFFF", width=2, dash=(4, 2),
+            fill="#00BFFF", stipple="gray25"
+        )
+
+    def _clear_box_overlay(self):
+        if self._box_sel_rect:
+            self.canvas.delete(self._box_sel_rect)
+            self._box_sel_rect = None
+
+    # ── 폴리곤 선택 ──
+
+    def _on_polygon_click(self, event):
+        """Ctrl+클릭: 폴리곤 꼭짓점 추가"""
+        t, f = self._px_to_data(event.x, event.y)
+
+        # 시작점 근처 클릭 → 폴리곤 닫기
+        if len(self._poly_points) >= 3:
+            sx, sy = self._data_to_px(*self._poly_points[0])
+            dist = ((event.x - sx)**2 + (event.y - sy)**2)**0.5
+            if dist < self._poly_snap_dist:
+                self._close_polygon()
+                return
+
+        self._poly_points.append((t, f))
+        self._redraw_polygon()
+
+    def _redraw_polygon(self):
+        """폴리곤 시각화 갱신"""
+        for cid in self._poly_canvas_ids:
+            self.canvas.delete(cid)
+        self._poly_canvas_ids.clear()
+
+        if not self._poly_points:
+            return
+
+        # 꼭짓점 표시
+        for i, (t, f) in enumerate(self._poly_points):
+            px, py = self._data_to_px(t, f)
+            r = 5 if i == 0 else 3
+            color = "#FF4444" if i == 0 else "#00FF88"
+            cid = self.canvas.create_oval(
+                px - r, py - r, px + r, py + r,
+                fill=color, outline="white", width=1
+            )
+            self._poly_canvas_ids.append(cid)
+
+        # 변끼리 연결
+        if len(self._poly_points) >= 2:
+            coords = []
+            for t, f in self._poly_points:
+                px, py = self._data_to_px(t, f)
+                coords.extend([px, py])
+            cid = self.canvas.create_line(
+                *coords, fill="#00FF88", width=2, dash=(4, 2)
+            )
+            self._poly_canvas_ids.append(cid)
+
+        # 시작점으로 향하는 가이드선
+        if len(self._poly_points) >= 3:
+            last_px, last_py = self._data_to_px(*self._poly_points[-1])
+            first_px, first_py = self._data_to_px(*self._poly_points[0])
+            cid = self.canvas.create_line(
+                last_px, last_py, first_px, first_py,
+                fill="#FF4444", width=1, dash=(2, 4)
+            )
+            self._poly_canvas_ids.append(cid)
+
+    def _close_polygon(self):
+        """폴리곤 닫기 → 필터 재생"""
+        points = list(self._poly_points)
+        self._cancel_polygon()
+        if len(points) >= 3:
+            self._play_filtered_polygon(points)
+
+    def _cancel_polygon(self):
+        """폴리곤 선택 취소"""
+        self._poly_points.clear()
+        for cid in self._poly_canvas_ids:
+            self.canvas.delete(cid)
+        self._poly_canvas_ids.clear()
+
+    # ── 필터 재생 ──
+
+    def _play_filtered_box(self, t0, t1, f_low, f_high):
+        """밴드패스 필터링된 박스 영역 재생"""
+        if not self._loaded or self.data is None or not HAS_PLAYBACK:
+            return
+        self._stop_playback()
+
+        speed = self._play_speed
+        volume = self._volume_var.get() / 100.0
+
+        tmp_path, duration = prepare_filtered_wav(
+            self.data, self.sr, t0, t1, f_low, f_high,
+            speed=speed, volume=volume
+        )
+        if not tmp_path:
+            return
+
+        self._play_status_var.set(
+            f"📦 박스 재생: {t0:.1f}-{t1:.1f}s, {f_low:.0f}-{f_high:.0f}Hz"
+        )
+        self._start_filtered_playback(tmp_path, duration, t0, t1)
+
+    def _play_filtered_polygon(self, points):
+        """STFT 마스킹으로 폴리곤 영역 재생"""
+        if not self._loaded or self.data is None or not HAS_PLAYBACK:
+            return
+        self._stop_playback()
+
+        speed = self._play_speed
+        volume = self._volume_var.get() / 100.0
+
+        self._play_status_var.set("✏ 폴리곤 필터 처리 중...")
+        self.frame.update_idletasks()
+
+        tmp_path, duration = prepare_polygon_wav(
+            self.data, self.sr, points,
+            speed=speed, volume=volume
+        )
+        if not tmp_path:
+            self._play_status_var.set("")
+            return
+
+        times = [p[0] for p in points]
+        t0, t1 = min(times), max(times)
+        self._play_status_var.set(
+            f"✏ 폴리곤 재생: {t0:.1f}-{t1:.1f}s ({len(points)}점)"
+        )
+        self._start_filtered_playback(tmp_path, duration, t0, t1)
+
+    def _start_filtered_playback(self, tmp_path, duration, t0, t1):
+        """필터링된 WAV 파일을 재생 (공통)"""
+        stop_event = threading.Event()
+        self._stop_event = stop_event
+        self._playing = True
+        self._play_generation += 1
+        gen = self._play_generation
+        self._play_start_time = t0
+        self._play_end_time = t1
+        self._play_start_wall = time.time()
+        self._play_range_t0 = t0
+        self._play_range_t1 = t1
+
+        self._btn_play.config(state="disabled")
+        self._btn_stop.config(state="normal")
+        self._update_playhead()
+
+        def _on_done(error):
+            if self._play_generation == gen:
+                if error:
+                    self.frame.after(0, lambda m=error: self._play_status_var.set(f"오류: {m}"))
+                self.frame.after(0, lambda g=gen: self._on_playback_done(g))
+
+        self._play_thread = play_wav_async(
+            tmp_path, stop_event, duration, on_done=_on_done
+        )
 
     def _on_resize(self, event):
         self._schedule_render(300)

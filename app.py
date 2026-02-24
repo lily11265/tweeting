@@ -41,10 +41,11 @@ except ImportError:
 from r_bridge import find_rscript
 from ui.analysis_tab import AnalysisTabMixin
 from ui.batch_tab import BatchTabMixin
+from ui.evaluation_tab import EvaluationTabMixin
 from ui.converter_tab import ConverterTabMixin
 
 
-class BirdSongDetectorApp(AnalysisTabMixin, BatchTabMixin, ConverterTabMixin):
+class BirdSongDetectorApp(AnalysisTabMixin, BatchTabMixin, EvaluationTabMixin, ConverterTabMixin):
     def __init__(self, root):
         self.root = root
         self.root.title("🐦 조류 음성 탐지기 (Bird Song Detector)")
@@ -105,7 +106,12 @@ class BirdSongDetectorApp(AnalysisTabMixin, BatchTabMixin, ConverterTabMixin):
         self.notebook.add(tab_autotune, text="  🎛 자동 튜닝  ")
         self._build_autotune_tab(tab_autotune)
 
-        # --- 탭 4: MP3 → WAV 변환기 ---
+        # --- 탭 4: 성능 평가 ---
+        tab_eval = ttk.Frame(self.notebook)
+        self.notebook.add(tab_eval, text="  📊 성능 평가  ")
+        self._build_evaluation_tab(tab_eval)
+
+        # --- 탭 5: MP3 → WAV 변환기 ---
         tab_converter = ttk.Frame(self.notebook)
         self.notebook.add(tab_converter, text="  🔄 MP3 → WAV 변환  ")
         self._build_converter_tab(tab_converter)

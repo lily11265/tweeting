@@ -5,6 +5,10 @@
 import tkinter as tk
 from tkinter import ttk
 import threading
+import time
+import os
+import wave
+import tempfile
 from pathlib import Path
 
 # numpy / scipy
@@ -21,6 +25,15 @@ try:
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
+
+# 오디오 재생
+from audio.playback import (
+    play_wav_async, stop_playback as _stop_audio,
+    prepare_playback_wav, HAS_PLAYBACK,
+)
+
+# 오디오 필터
+from audio.audio_filter import prepare_filtered_wav, prepare_polygon_wav
 
 # 모듈 내 참조
 from colormaps import COLORMAPS
@@ -68,6 +81,13 @@ class _TabState:
         # 팬 상태
         self.pan_start = None
         self.pan_view = None
+
+        # ── 박스/폴리곤 필터 재생 상태 ──
+        self.filter_box_start = None
+        self.filter_box_rect = None
+        self.poly_points = []
+        self.poly_canvas_ids = []
+        self.poly_snap_dist = 15
 
 
 class TemplateSelector:
@@ -135,13 +155,61 @@ class TemplateSelector:
         # 상단 정보바
         top = ttk.Frame(self.win)
         top.pack(fill="x", padx=5, pady=3)
-        hint = "좌클릭 드래그: 구간 선택  |  우클릭 드래그: 이동  |  휠: 확대/축소"
+        hint = "좌클릭: 구간선택 | 우클릭: 이동 | 휠: 줌 | Shift+드래그: 📦박스재생 | Ctrl+클릭: ✏폴리곤재생"
         if self.multi_select:
-            hint += "  |  여러 구간을 드래그하여 추가"
+            hint += "  |  여러 구간 드래그 가능"
         if self._tabbed:
-            hint += "  |  탭으로 음원 전환"
+            hint += "  |  탭 위에서 음원 전환"
         ttk.Label(top, text=hint, foreground="gray").pack(side="left")
         ttk.Button(top, text="↺ 전체 보기", command=self._reset_view).pack(side="right", padx=5)
+
+        # ── 재생 컨트롤 바 ──
+        play_bar = ttk.Frame(self.win)
+        play_bar.pack(fill="x", padx=5, pady=(0, 2))
+
+        self._btn_play = ttk.Button(play_bar, text="▶ 현재 뷰 재생", width=14,
+                                     command=self._play_view)
+        self._btn_play.pack(side="left", padx=(0, 2))
+
+        self._btn_stop = ttk.Button(play_bar, text="⏹ 정지", width=8,
+                                     command=self._stop_playback, state="disabled")
+        self._btn_stop.pack(side="left", padx=(0, 8))
+
+        ttk.Separator(play_bar, orient="vertical").pack(side="left", fill="y", padx=4, pady=2)
+
+        ttk.Label(play_bar, text="속도:").pack(side="left", padx=(4, 2))
+        self._speed_var = tk.DoubleVar(value=1.0)
+        self._play_speed = 1.0
+        for spd in [0.5, 0.75, 1.0, 1.5, 2.0]:
+            ttk.Radiobutton(play_bar, text=f"{spd}x", value=spd,
+                            variable=self._speed_var,
+                            command=lambda s=spd: self._set_speed(s)).pack(side="left", padx=1)
+
+        ttk.Separator(play_bar, orient="vertical").pack(side="left", fill="y", padx=6, pady=2)
+        ttk.Label(play_bar, text="🔊").pack(side="left", padx=(2, 0))
+        self._volume_var = tk.IntVar(value=80)
+        vol_scale = ttk.Scale(play_bar, from_=0, to=100,
+                              variable=self._volume_var,
+                              orient="horizontal", length=80)
+        vol_scale.pack(side="left", padx=(0, 2))
+        self._vol_label = ttk.Label(play_bar, text="80%", width=4)
+        self._vol_label.pack(side="left", padx=(0, 4))
+        vol_scale.config(command=lambda v: self._vol_label.config(text=f"{int(float(v))}%"))
+
+        self._play_status_var = tk.StringVar(value="")
+        ttk.Label(play_bar, textvariable=self._play_status_var,
+                  foreground="#FF6B6B", font=("Consolas", 8)).pack(side="right", padx=5)
+
+        # ── 재생 상태 ──
+        self._playing = False
+        self._play_thread = None
+        self._playhead_id = None
+        self._playhead_after_id = None
+        self._stop_event = threading.Event()
+        self._play_start_wall = 0.0
+        self._play_start_time = 0.0
+        self._play_end_time = 0.0
+        self._play_generation = 0
 
         # 탭 모드: Notebook  /  단일 모드: Canvas 직접
         if self._tabbed:
@@ -190,6 +258,7 @@ class TemplateSelector:
         canvas.bind("<Button-4>", lambda e, ti=tab_idx: self._on_wheel(e, ti))
         canvas.bind("<Button-5>", lambda e, ti=tab_idx: self._on_wheel(e, ti))
         canvas.bind("<Configure>", lambda e, ti=tab_idx: self._schedule_render(ti, 100))
+        canvas.bind("<Escape>", lambda e, ti=tab_idx: self._cancel_polygon(ti))
 
     # ============================================================
     # 탭 전환
@@ -358,6 +427,24 @@ class TemplateSelector:
     # ============================================================
     def _on_sel_start(self, event, tab_idx):
         tab = self._tabs[tab_idx]
+        if not tab.loaded:
+            return
+
+        shift = bool(event.state & 0x0001)
+        ctrl = bool(event.state & 0x0004)
+
+        # Ctrl+클릭 → 폴리곤
+        if ctrl:
+            self._on_polygon_click(event, tab_idx)
+            return
+
+        # Shift+드래그 → 박스 필터 재생
+        if shift:
+            tab.filter_box_start = (event.x, event.y)
+            self._clear_filter_box(tab_idx)
+            return
+
+        # 일반 드래그: 구간 선택
         tab.sel_start = (event.x, event.y)
         if tab.sel_rect_id:
             tab.canvas.delete(tab.sel_rect_id)
@@ -368,6 +455,12 @@ class TemplateSelector:
 
     def _on_sel_move(self, event, tab_idx):
         tab = self._tabs[tab_idx]
+
+        # 박스 필터 모드
+        if tab.filter_box_start:
+            self._update_filter_box(event, tab_idx)
+            return
+
         if not tab.sel_start or not tab.loaded:
             return
         x0, y0 = tab.sel_start
@@ -387,6 +480,16 @@ class TemplateSelector:
 
     def _on_sel_end(self, event, tab_idx):
         tab = self._tabs[tab_idx]
+
+        # 박스 필터 재생
+        if tab.filter_box_start:
+            sx, sy = tab.filter_box_start
+            tab.filter_box_start = None
+            t0, t1, f0, f1 = self._px_to_range(tab_idx, sx, sy, event.x, event.y)
+            if t1 - t0 > 0.01 and f1 - f0 > 10:
+                self._play_filtered_box(tab_idx, t0, t1, f0, f1)
+            return
+
         if not tab.sel_start or not tab.loaded:
             return
         x0, y0 = tab.sel_start
@@ -684,3 +787,286 @@ class TemplateSelector:
     @property
     def canvas(self):
         return self._tabs[self._active_tab_idx].canvas if self._tabs else None
+
+    # ============================================================
+    # 좌표 변환 (박스/폴리곤 재생용)
+    # ============================================================
+    def _px_to_data(self, tab_idx, px_x, px_y):
+        tab = self._tabs[tab_idx]
+        cw = max(tab.canvas.winfo_width(), 1)
+        ch = max(tab.canvas.winfo_height(), 1)
+        t = tab.t_start + (px_x / cw) * (tab.t_end - tab.t_start)
+        f = tab.f_high - (px_y / ch) * (tab.f_high - tab.f_low)
+        return t, f
+
+    def _data_to_px(self, tab_idx, t, f):
+        tab = self._tabs[tab_idx]
+        cw = max(tab.canvas.winfo_width(), 1)
+        ch = max(tab.canvas.winfo_height(), 1)
+        px_x = (t - tab.t_start) / max(tab.t_end - tab.t_start, 0.001) * cw
+        px_y = (tab.f_high - f) / max(tab.f_high - tab.f_low, 1) * ch
+        return px_x, px_y
+
+    # ============================================================
+    # 박스 필터 오버레이
+    # ============================================================
+    def _update_filter_box(self, event, tab_idx):
+        tab = self._tabs[tab_idx]
+        sx, sy = tab.filter_box_start
+        self._clear_filter_box(tab_idx)
+        tab.filter_box_rect = tab.canvas.create_rectangle(
+            sx, sy, event.x, event.y,
+            outline="#00BFFF", width=2, dash=(4, 2),
+            fill="#00BFFF", stipple="gray25"
+        )
+
+    def _clear_filter_box(self, tab_idx):
+        tab = self._tabs[tab_idx]
+        if tab.filter_box_rect:
+            tab.canvas.delete(tab.filter_box_rect)
+            tab.filter_box_rect = None
+
+    # ============================================================
+    # 폴리곤 선택
+    # ============================================================
+    def _on_polygon_click(self, event, tab_idx):
+        tab = self._tabs[tab_idx]
+        t, f = self._px_to_data(tab_idx, event.x, event.y)
+
+        if len(tab.poly_points) >= 3:
+            sx, sy = self._data_to_px(tab_idx, *tab.poly_points[0])
+            dist = ((event.x - sx)**2 + (event.y - sy)**2)**0.5
+            if dist < tab.poly_snap_dist:
+                self._close_polygon(tab_idx)
+                return
+
+        tab.poly_points.append((t, f))
+        self._redraw_polygon_overlay(tab_idx)
+
+    def _redraw_polygon_overlay(self, tab_idx):
+        tab = self._tabs[tab_idx]
+        for cid in tab.poly_canvas_ids:
+            tab.canvas.delete(cid)
+        tab.poly_canvas_ids.clear()
+
+        if not tab.poly_points:
+            return
+
+        for i, (t, f) in enumerate(tab.poly_points):
+            px, py = self._data_to_px(tab_idx, t, f)
+            r = 5 if i == 0 else 3
+            color = "#FF4444" if i == 0 else "#00FF88"
+            cid = tab.canvas.create_oval(
+                px - r, py - r, px + r, py + r,
+                fill=color, outline="white", width=1
+            )
+            tab.poly_canvas_ids.append(cid)
+
+        if len(tab.poly_points) >= 2:
+            coords = []
+            for t, f in tab.poly_points:
+                px, py = self._data_to_px(tab_idx, t, f)
+                coords.extend([px, py])
+            cid = tab.canvas.create_line(
+                *coords, fill="#00FF88", width=2, dash=(4, 2)
+            )
+            tab.poly_canvas_ids.append(cid)
+
+        if len(tab.poly_points) >= 3:
+            last_px, last_py = self._data_to_px(tab_idx, *tab.poly_points[-1])
+            first_px, first_py = self._data_to_px(tab_idx, *tab.poly_points[0])
+            cid = tab.canvas.create_line(
+                last_px, last_py, first_px, first_py,
+                fill="#FF4444", width=1, dash=(2, 4)
+            )
+            tab.poly_canvas_ids.append(cid)
+
+    def _close_polygon(self, tab_idx):
+        tab = self._tabs[tab_idx]
+        points = list(tab.poly_points)
+        self._cancel_polygon(tab_idx)
+        if len(points) >= 3:
+            self._play_filtered_polygon(tab_idx, points)
+
+    def _cancel_polygon(self, tab_idx):
+        tab = self._tabs[tab_idx]
+        tab.poly_points.clear()
+        for cid in tab.poly_canvas_ids:
+            tab.canvas.delete(cid)
+        tab.poly_canvas_ids.clear()
+
+    # ============================================================
+    # 재생
+    # ============================================================
+    def _set_speed(self, speed):
+        self._play_speed = speed
+
+    def _play_view(self):
+        tab = self._tabs[self._active_tab_idx]
+        if not tab.loaded or not HAS_PLAYBACK:
+            return
+        if self._playing:
+            self._stop_playback()
+            return
+        self._start_playback(self._active_tab_idx, tab.t_start, tab.t_end)
+
+    def _start_playback(self, tab_idx, t0, t1):
+        tab = self._tabs[tab_idx]
+        if not tab.loaded or tab.sr is None:
+            return
+
+        speed = self._play_speed
+        volume = self._volume_var.get() / 100.0
+
+        i0 = max(0, int(t0 * tab.sr))
+        i1 = min(len(tab.data), int(t1 * tab.sr))
+        segment = tab.data[i0:i1].copy()
+        if len(segment) < 64:
+            return
+
+        if abs(speed - 1.0) > 0.01 and HAS_SCIPY:
+            from scipy.signal import resample
+            new_len = max(64, int(len(segment) / speed))
+            segment = resample(segment, new_len)
+
+        max_val = np.max(np.abs(segment))
+        if max_val > 0:
+            segment = segment / max_val
+        pcm = (segment * 32767 * volume).astype(np.int16)
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+        try:
+            with wave.open(tmp_path, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(tab.sr)
+                wf.writeframes(pcm.tobytes())
+        finally:
+            os.close(tmp_fd)
+
+        actual_duration = (t1 - t0) / speed
+        self._do_play(tmp_path, actual_duration, t0, t1, tab_idx)
+
+    def _play_filtered_box(self, tab_idx, t0, t1, f_low, f_high):
+        tab = self._tabs[tab_idx]
+        if not tab.loaded or not HAS_PLAYBACK:
+            return
+        self._stop_playback()
+        speed = self._play_speed
+        volume = self._volume_var.get() / 100.0
+        tmp_path, duration = prepare_filtered_wav(
+            tab.data, tab.sr, t0, t1, f_low, f_high,
+            speed=speed, volume=volume
+        )
+        if not tmp_path:
+            return
+        self._play_status_var.set(
+            f"📦 박스: {t0:.1f}-{t1:.1f}s, {f_low:.0f}-{f_high:.0f}Hz"
+        )
+        self._do_play(tmp_path, duration, t0, t1, tab_idx)
+
+    def _play_filtered_polygon(self, tab_idx, points):
+        tab = self._tabs[tab_idx]
+        if not tab.loaded or not HAS_PLAYBACK:
+            return
+        self._stop_playback()
+        speed = self._play_speed
+        volume = self._volume_var.get() / 100.0
+        self._play_status_var.set("✏ 폴리곤 처리 중...")
+        self.win.update_idletasks()
+        tmp_path, duration = prepare_polygon_wav(
+            tab.data, tab.sr, points,
+            speed=speed, volume=volume
+        )
+        if not tmp_path:
+            self._play_status_var.set("")
+            return
+        times = [p[0] for p in points]
+        t0, t1 = min(times), max(times)
+        self._play_status_var.set(
+            f"✏ 폴리곤: {t0:.1f}-{t1:.1f}s ({len(points)}점)"
+        )
+        self._do_play(tmp_path, duration, t0, t1, tab_idx)
+
+    def _do_play(self, tmp_path, duration, t0, t1, tab_idx):
+        """WAV 파일 재생 공통"""
+        stop_event = threading.Event()
+        self._stop_event = stop_event
+        self._playing = True
+        self._play_generation += 1
+        gen = self._play_generation
+        self._play_start_time = t0
+        self._play_end_time = t1
+        self._play_start_wall = time.time()
+        self._play_tab_idx = tab_idx
+
+        self._btn_play.config(state="disabled")
+        self._btn_stop.config(state="normal")
+        self._play_status_var.set(f"▶ {t0:.1f}-{t1:.1f}s ({self._play_speed}x)")
+        self._update_playhead()
+
+        def _on_done(error):
+            if self._play_generation == gen:
+                if error:
+                    self.win.after(0, lambda m=error: self._play_status_var.set(f"오류: {m}"))
+                self.win.after(0, lambda: self._on_playback_done(gen))
+
+        self._play_thread = play_wav_async(
+            tmp_path, stop_event, duration, on_done=_on_done
+        )
+
+    def _stop_playback(self):
+        self._stop_event.set()
+        self._playing = False
+        self._clear_playhead()
+        self._btn_play.config(state="normal")
+        self._btn_stop.config(state="disabled")
+        self._play_status_var.set("")
+
+    def _on_playback_done(self, gen):
+        if gen != self._play_generation:
+            return
+        if not self._stop_event.is_set():
+            self._playing = False
+            self._clear_playhead()
+            self._btn_play.config(state="normal")
+            self._btn_stop.config(state="disabled")
+            self._play_status_var.set("✅ 재생 완료")
+            self.win.after(3000, lambda: self._play_status_var.set(""))
+
+    def _update_playhead(self):
+        if not self._playing:
+            return
+        elapsed = time.time() - self._play_start_wall
+        current = self._play_start_time + elapsed * self._play_speed
+        if current > self._play_end_time:
+            return
+
+        tab_idx = getattr(self, '_play_tab_idx', self._active_tab_idx)
+        tab = self._tabs[tab_idx]
+        cw = max(tab.canvas.winfo_width(), 1)
+        ch = max(tab.canvas.winfo_height(), 1)
+        view_dt = tab.t_end - tab.t_start
+        if view_dt > 0:
+            px = (current - tab.t_start) / view_dt * cw
+            if 0 <= px <= cw:
+                if self._playhead_id:
+                    tab.canvas.coords(self._playhead_id, px, 0, px, ch)
+                else:
+                    self._playhead_id = tab.canvas.create_line(
+                        px, 0, px, ch,
+                        fill="#FF3333", width=2, tags="playhead"
+                    )
+            else:
+                self._clear_playhead()
+
+        self._playhead_after_id = self.win.after(33, self._update_playhead)
+
+    def _clear_playhead(self):
+        if self._playhead_after_id:
+            self.win.after_cancel(self._playhead_after_id)
+            self._playhead_after_id = None
+        if self._playhead_id:
+            tab_idx = getattr(self, '_play_tab_idx', self._active_tab_idx)
+            self._tabs[tab_idx].canvas.delete(self._playhead_id)
+            self._playhead_id = None

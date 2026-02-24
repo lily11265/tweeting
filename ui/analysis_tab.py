@@ -170,7 +170,7 @@ class AnalysisTabMixin:
                                       command=self._at_run_tuning)
         self.at_btn_run.pack(side="left")
 
-        self.at_btn_apply = ttk.Button(frm_run, text="✅ 분석 탭에 적용",
+        self.at_btn_apply = ttk.Button(frm_run, text="✅ 분석/배치 탭에 적용",
                                         command=self._at_apply_weights, state="disabled")
         self.at_btn_apply.pack(side="left", padx=5)
 
@@ -405,41 +405,63 @@ class AnalysisTabMixin:
         self.at_btn_apply.config(state="normal")
 
     def _at_apply_weights(self):
-        """자동 튜닝 결과를 분석 탭의 전역 가중치 + 종별 가중치에 적용"""
+        """자동 튜닝 결과를 분석 탭 + 배치 분석 탭의 전역 가중치 + 종별 가중치에 적용"""
         if not self._at_tune_results:
             messagebox.showinfo("안내", "먼저 자동 튜닝을 실행하세요.")
             return
 
         applied_count = 0
+        batch_applied_count = 0
 
         # 첫 번째 종의 가중치를 전역 가중치에 적용
         first_sp = list(self._at_tune_results.keys())[0]
         first_w = self._at_tune_results[first_sp].get("weights", {})
         if first_w:
+            # 분석 탭 전역 가중치 적용
             for key, var in self.weight_vars.items():
                 if key in first_w:
                     var.set(round(first_w[key], 3))
             applied_count += 1
+
+            # 배치 탭 전역 가중치 적용 (존재하는 키만)
+            if hasattr(self, 'batch_weight_vars'):
+                for key, var in self.batch_weight_vars.items():
+                    if key in first_w:
+                        var.set(round(first_w[key], 3))
+                batch_applied_count += 1
 
         # 동일 이름의 종이 분석 탭에 있으면 종별 가중치도 적용
         for sp_name, res in self._at_tune_results.items():
             w = res.get("weights", {})
             if not w:
                 continue
+            # 분석 탭 종별 가중치
             for sp_frame in self.species_frames:
                 if sp_frame["name"].get().strip() == sp_name:
-                    # 종별 가중치 활성화 + 값 설정
                     sp_frame["use_custom_weights"].set(True)
                     for key, wvar in sp_frame["sp_weights"].items():
                         if key in w:
                             wvar.set(round(w[key], 3))
                     applied_count += 1
+            # 배치 탭 종별 가중치
+            if hasattr(self, 'batch_species_frames'):
+                for sp_frame in self.batch_species_frames:
+                    if sp_frame["name"].get().strip() == sp_name:
+                        sp_frame["use_custom_weights"].set(True)
+                        for key, wvar in sp_frame["sp_weights"].items():
+                            if key in w:
+                                wvar.set(round(w[key], 3))
+                        batch_applied_count += 1
 
         self.notebook.select(0)  # 분석 탭으로 전환
         messagebox.showinfo("완료",
             f"자동 튜닝 가중치가 적용되었습니다.\n\n"
-            f"전역 가중치: {first_sp}의 결과 적용\n"
-            f"종별 가중치: 동일 이름 {max(0, applied_count-1)}종에 적용")
+            f"[분석 탭]\n"
+            f"  전역 가중치: {first_sp}의 결과 적용\n"
+            f"  종별 가중치: 동일 이름 {max(0, applied_count-1)}종에 적용\n\n"
+            f"[배치 분석 탭]\n"
+            f"  전역 가중치: 적용 완료\n"
+            f"  종별 가중치: 동일 이름 {max(0, batch_applied_count-1)}종에 적용")
 
     # ========================================
     # 종 프레임 추가/삭제
