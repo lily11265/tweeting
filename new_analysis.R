@@ -1041,25 +1041,42 @@ auto_tune_weights <- function(wav, templates_info) {
   }
 
   # 5) 양성/음성 구간에서 6가지 지표 계산
+  # 충분한 샘플로 안정적 통계 추정 (기존 20 → 50, 속도와 정밀도 균형)
   positive_scores <- list()
   negative_scores <- list()
   n_pos <- 0
   n_neg <- 0
-  max_samples <- 20
+  max_samples <- 50
 
-  for (wi in seq_len(n_windows)) {
-    if (n_pos >= max_samples && n_neg >= max_samples) break
+  # ★ 계층적 샘플링: 시간 순서대로가 아닌, 유사도 분포에서 균등 추출
+  #    양성은 가장 유사한 것부터, 음성은 가장 비유사한 것부터 추출하되
+  #    다양한 유사도 수준을 포함하도록 함
+  pos_indices <- which(window_max_sims >= sim_threshold)
+  neg_indices <- which(window_max_sims < sim_threshold * 0.7)
 
+  # 유사도 기준 정렬 후 균등 간격 서브샘플링
+  if (length(pos_indices) > max_samples) {
+    pos_indices <- pos_indices[order(window_max_sims[pos_indices], decreasing = TRUE)]
+    step_p <- max(1, length(pos_indices) %/% max_samples)
+    pos_indices <- pos_indices[seq(1, length(pos_indices), by = step_p)][1:min(max_samples, length(pos_indices))]
+  }
+  if (length(neg_indices) > max_samples) {
+    neg_indices <- neg_indices[order(window_max_sims[neg_indices])]
+    step_n <- max(1, length(neg_indices) %/% max_samples)
+    neg_indices <- neg_indices[seq(1, length(neg_indices), by = step_n)][1:min(max_samples, length(neg_indices))]
+  }
+
+  sample_indices <- c(pos_indices, neg_indices)
+
+  for (wi in sample_indices) {
     w_start <- window_starts[wi]
     w_end <- w_start + window_dur
     sim <- window_max_sims[wi]
 
     is_positive <- sim >= sim_threshold
-    is_negative <- sim < sim_threshold * 0.7 # 명확한 음성만 사용
+    is_negative <- sim < sim_threshold * 0.7
 
-    if (is_positive && n_pos >= max_samples) next
-    if (!is_positive && n_neg >= max_samples) next
-    if (!is_positive && !is_negative) next # 경계 구간은 건너뜀
+    if (!is_positive && !is_negative) next
 
     seg <- extract_segment(wav, w_start, w_end)
     if (is.null(seg) || length(seg@left) < 100) next
@@ -1108,8 +1125,8 @@ auto_tune_weights <- function(wav, templates_info) {
   }
 
   log_info(sprintf(
-    "  수집 완료: 양성 %d건, 음성 %d건 (유사도 임계값 %.3f)",
-    n_pos, n_neg, sim_threshold
+    "  수집 완료: 양성 %d건, 음성 %d건 (유사도 임계값 %.3f, 후보: 양성=%d, 음성=%d)",
+    n_pos, n_neg, sim_threshold, length(pos_indices), length(neg_indices)
   ))
 
   if (n_pos < 1 || n_neg < 1) {
@@ -1127,6 +1144,8 @@ auto_tune_weights <- function(wav, templates_info) {
   }
 
   # 6) 각 지표별 변별력(discriminative power) 계산
+  #    LOO 교차검증: 각 샘플을 한 번씩 제외하고 Cohen's d를 계산,
+  #    평균을 취해 과적합 방지
   metric_names <- c("cor_score", "mfcc_score", "dtw_freq", "dtw_env", "band_energy", "harmonic_ratio")
   disc_power <- numeric(length(metric_names))
   names(disc_power) <- metric_names
@@ -1136,6 +1155,9 @@ auto_tune_weights <- function(wav, templates_info) {
   names(pos_means) <- metric_names
   names(neg_means) <- metric_names
 
+  n_all <- n_pos + n_neg
+  use_loo <- (n_pos >= 5 && n_neg >= 5) # LOO는 최소 5개 이상일 때만
+
   for (mi in seq_along(metric_names)) {
     mn <- metric_names[mi]
     pos_vals <- sapply(positive_scores, function(s) s[[mn]])
@@ -1143,19 +1165,45 @@ auto_tune_weights <- function(wav, templates_info) {
 
     pos_mean <- mean(pos_vals, na.rm = TRUE)
     neg_mean <- mean(neg_vals, na.rm = TRUE)
-    pos_sd <- sd(pos_vals, na.rm = TRUE)
-    neg_sd <- sd(neg_vals, na.rm = TRUE)
-
     pos_means[mi] <- pos_mean
     neg_means[mi] <- neg_mean
 
-    pooled_sd <- sqrt((pos_sd^2 + neg_sd^2) / 2)
-    if (is.na(pooled_sd) || pooled_sd < 0.001) pooled_sd <- 0.001
+    if (use_loo) {
+      # LOO 교차검증: 각 샘플 제외 후 Cohen's d 계산
+      loo_ds <- numeric(n_all)
 
-    disc_power[mi] <- max(0, (pos_mean - neg_mean) / pooled_sd)
+      for (li in seq_len(n_all)) {
+        if (li <= n_pos) {
+          # 양성 샘플 하나 제외
+          loo_pos <- pos_vals[-li]
+          loo_neg <- neg_vals
+        } else {
+          # 음성 샘플 하나 제외
+          loo_pos <- pos_vals
+          loo_neg <- neg_vals[-(li - n_pos)]
+        }
+
+        pm <- mean(loo_pos, na.rm = TRUE)
+        nm <- mean(loo_neg, na.rm = TRUE)
+        ps <- sd(loo_pos, na.rm = TRUE)
+        ns <- sd(loo_neg, na.rm = TRUE)
+        ps_d <- sqrt((ps^2 + ns^2) / 2)
+        if (is.na(ps_d) || ps_d < 0.001) ps_d <- 0.001
+        loo_ds[li] <- max(0, (pm - nm) / ps_d)
+      }
+
+      disc_power[mi] <- mean(loo_ds)
+    } else {
+      # 샘플 부족 시 기존 방식
+      pos_sd <- sd(pos_vals, na.rm = TRUE)
+      neg_sd <- sd(neg_vals, na.rm = TRUE)
+      pooled_sd <- sqrt((pos_sd^2 + neg_sd^2) / 2)
+      if (is.na(pooled_sd) || pooled_sd < 0.001) pooled_sd <- 0.001
+      disc_power[mi] <- max(0, (pos_mean - neg_mean) / pooled_sd)
+    }
   }
 
-  log_info("  지표별 변별력:")
+  log_info(sprintf("  지표별 변별력%s:", if (use_loo) " (LOO 교차검증)" else ""))
   for (mn in metric_names) {
     log_info(sprintf(
       "    %s: 양성=%.3f, 음성=%.3f → 변별력=%.3f",
@@ -1169,7 +1217,9 @@ auto_tune_weights <- function(wav, templates_info) {
     log_info("  ⚠ 모든 지표의 변별력이 0 → 기본 가중치 사용")
     optimal_weights <- DEFAULT_WEIGHTS
   } else {
-    raw_weights <- disc_power / total_disc
+    # ★ 변별력의 제곱근을 사용: 극단적 차이를 완화하여
+    #    한 지표에 가중치가 과도하게 몰리는 것을 방지
+    raw_weights <- sqrt(disc_power) / sum(sqrt(disc_power))
 
     min_w <- 0.05
     raw_weights <- pmax(raw_weights, min_w)

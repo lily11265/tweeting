@@ -133,8 +133,11 @@ def compute_curve_metrics(
       - 매칭되지 않으면 y_true = 0
       - composite score = y_score (연속값)
 
-    audio_duration이 주어지면, annotation이 없고 candidate에도 없는
-    시간 구간에서 가상 음성(score=0)을 자동 생성하여 평가 균형을 보정한다.
+    Two-tier 평가:
+      1) 후보 내 평가 (candidates-only): corMatch가 탐지한 후보만으로 AUROC 계산
+         → composite score의 실제 변별력 측정
+      2) 전체 평가 (with virtual negatives): 미탐지 구간 포함
+         → 시스템 전체 성능 (corMatch + composite) 측정
 
     Returns:
         dict with auroc, auprc, roc_curve, pr_curve, optimal thresholds
@@ -195,7 +198,28 @@ def compute_curve_metrics(
     n_neg_cand = sum(1 for y in y_true if y == 0)
     print(f"[DEBUG] curve_metrics: 후보 매칭 결과 — 양성={n_pos_cand}, 음성={n_neg_cand} (총 {len(y_true)}건)")
 
+    # ── Tier 1: 후보 내 평가 (candidates-only AUROC) ──
+    # composite score의 실제 변별력 = corMatch 후보 내에서 TP vs FP 분류 능력
+    y_true_cand = np.array(y_true)
+    y_scores_cand = np.array(y_scores)
+    auroc_candidates = None
+    if len(np.unique(y_true_cand)) >= 2:
+        auroc_candidates = float(roc_auc_score(y_true_cand, y_scores_cand))
+        print(f"[DEBUG] curve_metrics: 후보 내 AUROC = {auroc_candidates:.4f}")
+    else:
+        print(f"[DEBUG] curve_metrics: 후보 내 단일 클래스 → 후보 AUROC 생략")
+
     # ── 가상 음성 생성 (annotation 미포함 구간) ──
+    # 가상 음성의 score: corMatch 탐지 실패 = 상관이 cutoff 미만
+    # → 실제 FP 후보의 최저 score 근방으로 추정 (score=0은 비현실적)
+    fp_scores = [s for s, y in zip(y_scores, y_true) if y == 0]
+    if fp_scores:
+        # FP 후보 중 하위 25%의 score를 가상 음성 기준으로 사용
+        virtual_neg_score = float(np.percentile(fp_scores, 25))
+    else:
+        # FP가 없으면 전체 후보 최저 score의 절반
+        virtual_neg_score = float(min(y_scores) * 0.5) if y_scores else 0.0
+
     n_virtual = 0
     if audio_duration is not None and audio_duration > 0:
         # 기존 candidate 시간 목록
@@ -223,14 +247,14 @@ def compute_curve_metrics(
                 t += neg_window_step
                 continue
 
-            # 3) 가상 음성 추가 (corMatch에도 안 잡힌 구간 → score=0)
+            # 3) 가상 음성 추가 — FP 분포 기반 합리적 score 추정
             y_true.append(0)
-            y_scores.append(0.0)
+            y_scores.append(virtual_neg_score)
             n_virtual += 1
 
             t += neg_window_step
 
-    print(f"[DEBUG] curve_metrics: 가상 음성 {n_virtual}건 추가 (audio_duration={audio_duration}, step={neg_window_step})")
+    print(f"[DEBUG] curve_metrics: 가상 음성 {n_virtual}건 추가 (score={virtual_neg_score:.4f}, audio_duration={audio_duration}, step={neg_window_step})")
 
     y_true = np.array(y_true)
     y_scores = np.array(y_scores)
@@ -244,7 +268,7 @@ def compute_curve_metrics(
         print(f"[DEBUG] curve_metrics: 양성/음성 둘 다 필요 → None 반환")
         return None
 
-    # AUROC
+    # AUROC (전체: 후보 + 가상 음성)
     auroc = roc_auc_score(y_true, y_scores)
 
     # AUPRC
@@ -254,10 +278,10 @@ def compute_curve_metrics(
     # ROC 곡선 데이터
     fpr, tpr, roc_thresholds = roc_curve(y_true, y_scores)
 
-    # 최적 임계값 (F1 기준)
+    # 최적 임계값 (F1 기준) — 0.01부터 탐색
     best_f1 = 0
     best_thresh_f1 = 0.5
-    for t in np.arange(0.05, 1.0, 0.01):
+    for t in np.arange(0.01, 1.0, 0.01):
         pred_binary = (y_scores >= t).astype(int)
         f1_val = f1_score(y_true, pred_binary, zero_division=0)
         if f1_val > best_f1:
@@ -269,7 +293,7 @@ def compute_curve_metrics(
     best_j_idx = np.argmax(j_scores)
     best_thresh_youden = roc_thresholds[best_j_idx]
 
-    return {
+    result = {
         "auroc": round(float(auroc), 4),
         "auprc": round(float(auprc), 4),
         "roc_curve": {
@@ -289,6 +313,12 @@ def compute_curve_metrics(
         "y_true": y_true.tolist(),
         "y_scores": y_scores.tolist(),
     }
+
+    # Tier 1 결과 추가 (후보 내 AUROC — composite score의 순수 변별력)
+    if auroc_candidates is not None:
+        result["auroc_candidates_only"] = round(auroc_candidates, 4)
+
+    return result
 
 
 def find_optimal_thresholds(
