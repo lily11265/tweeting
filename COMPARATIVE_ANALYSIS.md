@@ -12,8 +12,8 @@
 | **개발** | 독자 개발 | Cornell Lab + Chemnitz Univ. | Wildlife Acoustics | Cornell Lab |
 | **핵심 기술** | 템플릿 매칭 + 다중 메트릭 종합 판별 | EfficientNet CNN 딥러닝 | Hidden Markov Model (HMM) 클러스터링 | TensorFlow Learning Detector |
 | **모델 유형** | 신호처리 기반 앙상블 (비지도+지도) | 사전훈련 딥러닝 | 비지도 클러스터링 + 훈련 가능 분류기 | 지도/비지도 ML |
-| **종 DB** | 사용자 정의 (무제한) | 6,000+ 종 (글로벌) | 종별 분류기 별도 훈련 | 사용자 훈련 |
-| **가격** | 무료/오픈소스 | CC BY-NC 4.0 (비상업 무료) | $300/년 라이선스 | $100~$400 라이선스 |
+| **종 DB** | 사용자 정의 (무제한) | 6,522종 (글로벌) | 박쥐 Auto-ID (6개 지역) + 사용자 훈련 | ~3,000종 (BirdNET v2.2 내장) + 사용자 훈련 |
+| **가격** | 무료/오픈소스 | CC BY-NC-SA 4.0 (비상업 무료) | ~$300/년 라이선스 | $50~$400 라이선스 (유형별) |
 | **플랫폼** | Windows/Linux (Python+R) | Windows/Linux/Mac/RPi/모바일 | Windows/Mac | Windows/Mac |
 
 ---
@@ -39,14 +39,19 @@
 
 #### BirdNET Analyzer
 ```
-입력 오디오 → 3초 윈도우 분할 → 멜스펙트로그램 → EfficientNet CNN
-→ 6,000+ 종 분류 확률 → 신뢰도 임계값 필터링 → 결과
+입력 오디오 → 48kHz 리샘플링 → 3초 윈도우 분할 → 듀얼 멜스펙트로그램:
+  채널1: 0~3kHz (nfft=2048, 96 mel bins)
+  채널2: 500Hz~15kHz (nfft=1024, 96 mel bins)
+→ EfficientNet V2 CNN (v2.4) → 6,522종 분류 확률
+→ Species Range Meta Model (eBird 기반 지리 필터) → 결과
 ```
 
 #### Kaleidoscope Pro
 ```
-입력 오디오 → 시간-주파수 파라미터 추출 → HMM 클러스터링
-→ 유사 음향 그룹화 → (선택) 종별 분류기 훈련/적용 → 결과
+입력 오디오 → DCT(이산 코사인 변환) 특성 추출 → HMM 클러스터링
+→ 유사 음향 자동 그룹화 → (선택) 종별 분류기 훈련/적용 → 결과
+  - FFT 윈도우: 주파수 범위별 자동 조정 (128~1024 샘플)
+  - 파라미터: 최대 HMM 상태 수, 클러스터 수, 클러스터 중심 거리
 ```
 
 #### Raven Pro
@@ -171,7 +176,18 @@
 - BirdNET은 설치 즉시 6,000종 탐지 가능 → 일반 사용자의 초기 진입 장벽 차이가 큼
 - 광역 종 조사(species inventory)에는 BirdNET 대비 비효율적
 
-### 4.2 딥러닝 특성 학습 부재
+### 4.2 공개된 정량적 성능 비교 불가
+
+상용/공개 도구들은 대규모 벤치마크 결과가 공개되어 있으나, 본 프로젝트는 비교 데이터가 없다:
+
+| 도구 | 공개된 성능 지표 |
+|------|-----------------|
+| **BirdNET** | 글로벌 평가(2025): Precision 0.55~0.76, Recall 0.24~0.72, 최적 F1 0.84 |
+| **Kaleidoscope Pro** | 유럽 가마우지 연구: 검출률 98.4% (BirdNET 93.7% 대비 우위) |
+| **Raven Pro** | 유사종 비교 연구: Recall 30~90%, Precision 27~99% (설정 의존) |
+| **tweeting** | 공개 벤치마크 없음 (내장 평가 프레임워크는 있으나 외부 검증 미실시) |
+
+### 4.3 딥러닝 특성 학습 부재
 
 | 도구 | 특성 추출 방식 |
 |------|---------------|
@@ -184,7 +200,7 @@
 - CNN은 인간이 인지하지 못하는 미세한 특성 차이도 학습 가능
 - 특히 유사종 구별(예: 쇠박새 vs 박새)에서 딥러닝의 정밀도가 일반적으로 우수
 
-### 4.3 대규모 배치 처리 성능
+### 4.4 대규모 배치 처리 성능
 
 **R 서브프로세스 기반 아키텍처의 병목:**
 - 각 분석마다 R 프로세스 생성 → 패키지 로딩 → JSON 설정 파싱 → 분석 → 프로세스 종료
@@ -197,7 +213,7 @@
 - Kaleidoscope Pro: 대용량 데이터셋에 최적화된 배치 처리
 - tweeting: 1시간 음원에 대해 종당 수 분~수십 분 소요 (DTW 계산 병목)
 
-### 4.4 실시간 처리 미지원
+### 4.5 실시간 처리 미지원
 
 | 도구 | 실시간 처리 |
 |------|------------|
@@ -209,7 +225,7 @@
 - BirdNET-Pi는 Raspberry Pi에서 24/7 실시간 모니터링 가능
 - 본 프로젝트는 녹음된 WAV 파일의 사후 분석만 가능 → 실시간 모니터링 불가
 
-### 4.5 배포 유연성 부족
+### 4.6 배포 유연성 부족
 
 | 도구 | 배포 옵션 |
 |------|----------|
@@ -221,7 +237,7 @@
 - R과 5개 이상의 R 패키지(seewave, tuneR, monitoR, dtw, jsonlite) + Python 환경이 모두 필요
 - Portable R 번들링을 지원하나, 엣지 디바이스나 모바일 배포는 불가능
 
-### 4.6 커뮤니티/생태계 규모
+### 4.7 커뮤니티/생태계 규모
 
 | 도구 | 커뮤니티 규모 |
 |------|-------------|
@@ -230,13 +246,13 @@
 | **Kaleidoscope Pro** | Wildlife Acoustics 기기 사용자 기반 |
 | **tweeting** | 독립 프로젝트 |
 
-### 4.7 멀티채널/멀티소스 처리 제한
+### 4.8 멀티채널/멀티소스 처리 제한
 
 - Raven Pro: 최대 32채널 동시 분석, NI-DAQ/ASIO 하드웨어 직접 지원
 - 본 프로젝트: 모노 처리만 지원 (스테레오는 자동 다운믹스)
 - 음원 위치 추정(sound localization) 등 멀티채널 응용 불가
 
-### 4.8 음향 지수(Acoustic Indices) 미지원
+### 4.9 음향 지수(Acoustic Indices) 미지원
 
 - Kaleidoscope Pro: 25개 음향 지수(BIO, ACI, NDSI 등) 내장 → 서식지 건강도 평가
 - Raven Pro: 70+ 측정 지표
@@ -332,3 +348,14 @@ tweeting은 **전문 연구자를 위한 정밀 탐지 도구**로서 독자적�
 ---
 
 *본 보고서는 코드 분석 및 공개 자료 기반으로 작성되었습니다.*
+
+---
+
+## 참고 자료
+
+- Kahl, S., et al. (2021). BirdNET: A deep learning solution for avian diversity monitoring. *Ecological Informatics*, 61.
+- BirdNET-Analyzer GitHub: https://github.com/birdnet-team/BirdNET-Analyzer
+- BirdNET 글로벌 성능 평가 (2025): https://www.sciencedirect.com/science/article/pii/S1470160X25014827
+- Kaleidoscope Pro - Wildlife Acoustics: https://www.wildlifeacoustics.com/products/kaleidoscope-pro
+- Raven Pro - Cornell Lab: https://www.ravensoundsoftware.com/software/raven-pro/
+- 유사종 자동식별 소프트웨어 비교 연구: https://www.tandfonline.com/doi/abs/10.1080/09524622.2021.1945952
