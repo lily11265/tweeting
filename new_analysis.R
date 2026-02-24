@@ -1065,14 +1065,22 @@ compute_band_energy_envelope <- function(wav, f_low, f_high, window_sec = 0.05) 
         output = "Wave"
       )
 
-      # 제곱 신호 → 이동 평균으로 단시간 에너지
-      sig <- as.numeric(filtered@left)^2
+      # ★ 에너지 집중도(비율) 포락선: 대역 에너지 / 전체 에너지
+      # 절대 에너지가 아닌 비율을 사용해야 큰 소음에 끌리지 않고
+      # 실제로 대역에 에너지가 집중된 구간(새소리)을 찾음
+      sig_band <- as.numeric(filtered@left)^2
+      sig_total <- as.numeric(wav@left)^2
+
       win_samples <- max(1, round(window_sec * sr))
       kernel <- rep(1 / win_samples, win_samples)
-      energy <- stats::filter(sig, kernel, sides = 2)
-      energy[is.na(energy)] <- 0
+      energy_band <- stats::filter(sig_band, kernel, sides = 2)
+      energy_total <- stats::filter(sig_total, kernel, sides = 2)
+      energy_band[is.na(energy_band)] <- 0
+      energy_total[is.na(energy_total)] <- 0
 
-      list(energy = as.numeric(energy), sr = sr)
+      ratio <- as.numeric(energy_band) / (as.numeric(energy_total) + 1e-10)
+
+      list(energy = ratio, sr = sr)
     },
     error = function(e) {
       log_debug(sprintf("  에너지 포락선 계산 오류: %s", e$message))
@@ -1106,6 +1114,50 @@ refine_peak_position <- function(energy_env, peak_time, ref_duration) {
   refined_time <- (s_start + best_offset) / sr
 
   refined_time
+}
+
+#' 대역 에너지 포락선에서 피크를 탐색하여 후보 시간 목록을 반환
+#' corMatch가 놓친 울음 구간을 보충하는 용도
+#' @param energy_env compute_band_energy_envelope() 결과
+#' @param ref_duration 템플릿 길이 (초) — 최소 피크 간격으로 사용
+#' @return 피크 시간 벡터 (초)
+find_energy_peaks <- function(energy_env, ref_duration) {
+  if (is.null(energy_env)) return(numeric(0))
+
+  sr <- energy_env$sr
+  ratio <- energy_env$energy
+  n <- length(ratio)
+
+  # 최소 피크 간격 = 템플릿 길이
+  gap_samples <- round(ref_duration * sr)
+
+  # 적응형 임계값: 중앙값 + 2×MAD (이상치에 견고)
+  med <- median(ratio)
+  mad_val <- mad(ratio)
+  threshold <- med + 2 * mad_val
+  # 최소 기준: 에너지 집중도 1% 이상
+  threshold <- max(threshold, 0.01)
+
+  # Greedy 피크 검출: 최고점 선택 → ±gap 제외 → 반복
+  peaks <- numeric(0)
+  remaining <- seq_len(n)
+
+  while (length(remaining) > 0) {
+    best_in_remaining <- which.max(ratio[remaining])
+    max_idx <- remaining[best_in_remaining]
+
+    if (ratio[max_idx] < threshold) break
+
+    peaks <- c(peaks, max_idx)
+
+    # ±gap 범위 제외
+    exclude_start <- max(1, max_idx - gap_samples)
+    exclude_end <- min(n, max_idx + gap_samples)
+    remaining <- remaining[remaining < exclude_start | remaining > exclude_end]
+  }
+
+  # 시간으로 변환하여 정렬
+  sort(peaks / sr)
 }
 
 # ============================================================
@@ -2549,6 +2601,68 @@ for (t_idx in seq_along(template_names)) {
 
   if (n_refined > 0) {
     log_info(sprintf("  ★ 피크 보정: %d/%d건 위치 재조정 (대역 에너지 기반)", n_refined, nrow(det)))
+  }
+
+  # ★ 에너지 피크 보충: corMatch가 놓친 울음 구간을 대역 에너지 포락선으로 탐색
+  if (!is.null(band_env) && !is.null(ref_wav)) {
+    energy_peaks <- find_energy_peaks(band_env, ref_duration)
+
+    # 기존 후보와 겹치지 않는 에너지 피크만 추가
+    existing_times <- sapply(sp_results, function(r) {
+      if (is.null(r)) NA else r$time[1]
+    })
+    existing_times <- existing_times[!is.na(existing_times)]
+    min_gap_sec <- max(0.5, ref_duration * 0.5)
+
+    n_energy_added <- 0
+    for (ep in energy_peaks) {
+      if (length(existing_times) > 0 && any(abs(existing_times - ep) < min_gap_sec)) next
+
+      margin <- ref_duration * 0.2
+      seg_start <- max(0, ep - ref_duration / 2 - margin)
+      seg_end <- ep + ref_duration / 2 + margin
+      segment <- extract_segment(main_wav, seg_start, seg_end)
+      if (is.null(segment) || length(segment@left) < 100) next
+
+      individual_scores <- list(cor_score = 0)
+      individual_scores$band_energy <- compute_band_energy_ratio(
+        segment, ref_freq$f_low, ref_freq$f_high
+      )
+      individual_scores$harmonic_ratio <- compute_harmonic_ratio(
+        segment, ref_freq$f_low, ref_freq$f_high
+      )
+      individual_scores$snr <- compute_snr_ratio(
+        segment, ref_freq$f_low, ref_freq$f_high
+      )
+      individual_scores$mfcc_score <- compute_mfcc_dtw_similarity(ref_wav, segment)
+      individual_scores$dtw_freq <- compute_freq_contour_dtw(
+        ref_wav, segment, ref_freq$f_low, ref_freq$f_high
+      )
+      individual_scores$dtw_env <- compute_envelope_dtw(ref_wav, segment)
+
+      composite <- compute_composite_score(individual_scores, sp_weights)
+
+      n_energy_added <- n_energy_added + 1
+      sp_results[[length(sp_results) + 1]] <- data.frame(
+        species = sp_name,
+        time = ep,
+        cor_score = 0,
+        mfcc_score = round(individual_scores$mfcc_score, 4),
+        dtw_freq = round(individual_scores$dtw_freq, 4),
+        dtw_env = round(individual_scores$dtw_env, 4),
+        band_energy = round(individual_scores$band_energy, 4),
+        harmonic_ratio = round(individual_scores$harmonic_ratio, 4),
+        snr = round(individual_scores$snr, 4),
+        composite = round(composite, 4),
+        template_label = tmpl_name,
+        stringsAsFactors = FALSE
+      )
+      existing_times <- c(existing_times, ep)
+    }
+
+    if (n_energy_added > 0) {
+      log_info(sprintf("  ★ 에너지 피크 보충: %d건 추가 후보 (corMatch 미검출 구간)", n_energy_added))
+    }
   }
 
   # 결합
