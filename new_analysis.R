@@ -741,7 +741,11 @@ compute_envelope_dtw <- function(wav_template, wav_segment) {
 
 #' 주파수 대역 에너지 집중도
 #' 해당 종의 울음 주파수 대역에 전체 에너지 대비 몇 %가 집중되어 있는가
-#' @return 0~1 비율
+#' 주파수 대역 에너지 집중도
+#' 종의 주파수 대역에 에너지가 집중될수록 높은 값을 반환.
+#' 전체 스펙트럼 대비 비율은 대역 너비에 의존하므로,
+#' 대역 내 평균 에너지 밀도 vs 대역 외 평균 에너지 밀도의 비율로 계산.
+#' @return 0~1 에너지 집중도 (높을수록 대역에 에너지 집중)
 compute_band_energy_ratio <- function(wav_segment, f_low, f_high) {
   tryCatch(
     {
@@ -753,19 +757,31 @@ compute_band_energy_ratio <- function(wav_segment, f_low, f_high) {
       }
 
       freqs <- spec[, 1] # kHz
-      amplitudes <- spec[, 2]
+      power <- spec[, 2]^2
 
-      # 전체 에너지
-      total_energy <- sum(amplitudes^2)
-      if (total_energy == 0) {
+      # 대역 내/외 인덱스
+      in_band <- freqs >= f_low & freqs <= f_high
+      n_in <- sum(in_band)
+      n_out <- sum(!in_band)
+
+      if (n_in == 0 || n_out == 0) {
         return(0)
       }
 
-      # 대역 내 에너지
-      in_band <- freqs >= f_low & freqs <= f_high
-      band_energy <- sum(amplitudes[in_band]^2)
+      # 평균 에너지 밀도 (bin 당)
+      mean_in <- sum(power[in_band]) / n_in
+      mean_out <- sum(power[!in_band]) / n_out
 
-      band_energy / total_energy
+      if (mean_in + mean_out < 1e-10) {
+        return(0)
+      }
+
+      # 비율 → 시그모이드 정규화 (0~1)
+      # ratio=1 → 대역 내외 동일 → 0.5
+      # ratio=10 → 대역에 10배 집중 → ~0.9
+      # ratio=0.1 → 대역에 1/10 → ~0.1
+      ratio_db <- 10 * log10(mean_in / max(mean_out, 1e-10))
+      1 / (1 + exp(-0.3 * (ratio_db - 0)))
     },
     error = function(e) {
       log_debug(sprintf("    대역에너지 계산 오류: %s", e$message))
@@ -906,16 +922,22 @@ compute_snr_ratio <- function(wav_segment, f_low, f_high) {
         return(0)
       }
 
-      # dB 스케일 SNR → 0~1 시그모이드 정규화
-      # SNR(dB) = 10 * log10(signal / noise)
-      # 0dB → 0.5, 10dB → ~0.9, -10dB → ~0.1
-      if (noise_power < 1e-10) {
+      # 대역 내 에너지 밀도 vs 대역 외 에너지 밀도 비율
+      # (bin 수로 정규화하여 대역 너비에 무관하게)
+      n_in <- sum(in_band)
+      n_out <- sum(!in_band)
+      if (n_in == 0 || n_out == 0) return(0)
+
+      mean_signal <- signal_power / n_in
+      mean_noise <- noise_power / n_out
+
+      if (mean_noise < 1e-10) {
         return(1.0) # 소음 없음
       }
-      snr_db <- 10 * log10(signal_power / noise_power)
-      # 시그모이드: 1 / (1 + exp(-k * (snr - midpoint)))
-      # midpoint=3dB, k=0.3 → 부드러운 전환
-      1 / (1 + exp(-0.3 * (snr_db - 3)))
+      snr_db <- 10 * log10(mean_signal / mean_noise)
+      # 시그모이드: midpoint=-3dB (야외 녹음에서 현실적), k=0.25
+      # -3dB → 0.5, 7dB → ~0.9, -13dB → ~0.1
+      1 / (1 + exp(-0.25 * (snr_db - (-3))))
     },
     error = function(e) {
       log_debug(sprintf("    SNR 계산 오류: %s", e$message))
@@ -1129,7 +1151,34 @@ auto_tune_weights <- function(wav, templates_info) {
   #    양성은 가장 유사한 것부터, 음성은 가장 비유사한 것부터 추출하되
   #    다양한 유사도 수준을 포함하도록 함
   pos_indices <- which(window_max_sims >= sim_threshold)
-  neg_indices <- which(window_max_sims < sim_threshold * 0.7)
+
+  # ★ 적응형 음성 임계값: 최소 10개 음성을 확보할 때까지 단계적 완화
+  min_neg_required <- 10
+  neg_factor <- 0.7 # 시작: sim_threshold * 0.7
+  neg_indices <- which(window_max_sims < sim_threshold * neg_factor &
+                        window_max_sims < 1.0) # sim=1.0 (템플릿 겹침) 제외
+
+  while (length(neg_indices) < min_neg_required && neg_factor < 0.95) {
+    neg_factor <- neg_factor + 0.05
+    neg_indices <- which(window_max_sims < sim_threshold * neg_factor &
+                          window_max_sims < 1.0)
+  }
+
+  # 여전히 부족하면: 유사도 하위 N개를 강제 음성으로 사용
+  if (length(neg_indices) < min_neg_required) {
+    non_template_indices <- which(window_max_sims < 1.0) # 템플릿 겹침 제외
+    if (length(non_template_indices) >= min_neg_required) {
+      sorted_idx <- non_template_indices[order(window_max_sims[non_template_indices])]
+      neg_indices <- sorted_idx[1:min(max_samples, length(sorted_idx))]
+    } else if (length(non_template_indices) > 0) {
+      neg_indices <- non_template_indices
+    }
+    log_info(sprintf("  ⚠ 음성 부족 → 유사도 하위 %d개 강제 사용 (factor=%.2f)",
+                     length(neg_indices), neg_factor))
+  } else {
+    log_info(sprintf("  음성 임계값: sim < %.3f (factor=%.2f, %d건)",
+                     sim_threshold * neg_factor, neg_factor, length(neg_indices)))
+  }
 
   # 유사도 기준 정렬 후 균등 간격 서브샘플링
   if (length(pos_indices) > max_samples) {
@@ -1207,8 +1256,11 @@ auto_tune_weights <- function(wav, templates_info) {
     n_pos, n_neg, sim_threshold, length(pos_indices), length(neg_indices)
   ))
 
-  if (n_pos < 1 || n_neg < 1) {
-    log_info("  ⚠ 샘플 부족 → 기본 가중치 사용")
+  # ★ 최소 3건씩 필요 (n=1~2에서는 sd, Cohen's d 계산이 불안정)
+  if (n_pos < 3 || n_neg < 3) {
+    log_info(sprintf(
+      "  ⚠ 샘플 부족 (양성=%d, 음성=%d, 최소=3) → 기본 가중치 사용", n_pos, n_neg
+    ))
     log_info(sprintf("  [진단] 유사도 임계값: %.3f", sim_threshold))
     if (length(non_overlap_sims) > 0) {
       n_above <- sum(non_overlap_sims >= sim_threshold)
@@ -1216,7 +1268,7 @@ auto_tune_weights <- function(wav, templates_info) {
     }
     return(list(weights = DEFAULT_WEIGHTS, diagnostics = list(
       n_positive = n_pos, n_negative = n_neg,
-      message = "샘플 부족으로 자동 튜닝 불가",
+      message = "샘플 부족으로 자동 튜닝 불가 (최소 양성 3건, 음성 3건 필요)",
       sim_threshold = sim_threshold
     )))
   }
@@ -1238,8 +1290,14 @@ auto_tune_weights <- function(wav, templates_info) {
 
   for (mi in seq_along(metric_names)) {
     mn <- metric_names[mi]
-    pos_vals <- sapply(positive_scores, function(s) s[[mn]])
-    neg_vals <- sapply(negative_scores, function(s) s[[mn]])
+    pos_vals <- sapply(positive_scores, function(s) {
+      v <- s[[mn]]
+      if (is.null(v) || is.na(v) || is.nan(v)) 0 else v
+    })
+    neg_vals <- sapply(negative_scores, function(s) {
+      v <- s[[mn]]
+      if (is.null(v) || is.na(v) || is.nan(v)) 0 else v
+    })
 
     pos_mean <- mean(pos_vals, na.rm = TRUE)
     neg_mean <- mean(neg_vals, na.rm = TRUE)
