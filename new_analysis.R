@@ -1165,14 +1165,17 @@ auto_tune_weights <- function(wav, templates_info) {
   }
 
   sample_indices <- c(pos_indices, neg_indices)
+  # ★ 음성 인덱스를 set으로 보관 — 루프에서 적응형 임계값과 일치시킴
+  neg_index_set <- neg_indices
 
   for (wi in sample_indices) {
     w_start <- window_starts[wi]
     w_end <- w_start + window_dur
     sim <- window_max_sims[wi]
 
-    is_positive <- sim >= sim_threshold
-    is_negative <- sim < sim_threshold * 0.7
+    # ★ 양성/음성 판정: neg_index_set 기반 (적응형 임계값 반영)
+    is_positive <- wi %in% pos_indices
+    is_negative <- wi %in% neg_index_set
 
     if (!is_positive && !is_negative) next
 
