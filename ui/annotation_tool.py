@@ -31,12 +31,15 @@ except ImportError:
 
 # 오디오 재생
 from audio.playback import (
-    play_wav_async, stop_playback as _stop_audio,
+    play_wav_async, play_numpy_async, stop_playback as _stop_audio,
     prepare_playback_wav, HAS_PLAYBACK,
 )
 
 # 오디오 필터 (밴드패스, 폴리곤 마스킹)
-from audio.audio_filter import prepare_filtered_wav, prepare_polygon_wav
+from audio.audio_filter import (
+    prepare_filtered_wav, prepare_polygon_wav,
+    prepare_filtered_pcm, prepare_polygon_pcm,
+)
 
 from colormaps import COLORMAPS
 
@@ -718,16 +721,16 @@ class AnnotationTool:
         self._stop_playback()
         speed = self._play_speed
         volume = self._volume_var.get() / 100.0
-        tmp_path, duration = prepare_filtered_wav(
+        pcm, sr, duration = prepare_filtered_pcm(
             self.data, self.sr, t0, t1, f_low, f_high,
             speed=speed, volume=volume
         )
-        if not tmp_path:
+        if pcm is None:
             return
         self._play_status_var.set(
             f"📦 박스 재생: {t0:.1f}-{t1:.1f}s, {f_low:.0f}-{f_high:.0f}Hz"
         )
-        self._start_filtered_playback(tmp_path, duration, t0, t1)
+        self._start_filtered_playback_pcm(pcm, sr, duration, t0, t1)
 
     def _play_filtered_polygon(self, points):
         if not self._loaded or self.data is None or not HAS_PLAYBACK:
@@ -737,11 +740,11 @@ class AnnotationTool:
         volume = self._volume_var.get() / 100.0
         self._play_status_var.set("✏ 폴리곤 필터 처리 중...")
         self.win.update_idletasks()
-        tmp_path, duration = prepare_polygon_wav(
+        pcm, sr, duration = prepare_polygon_pcm(
             self.data, self.sr, points,
             speed=speed, volume=volume
         )
-        if not tmp_path:
+        if pcm is None:
             self._play_status_var.set("")
             return
         times = [p[0] for p in points]
@@ -749,9 +752,9 @@ class AnnotationTool:
         self._play_status_var.set(
             f"✏ 폴리곤 재생: {t0:.1f}-{t1:.1f}s ({len(points)}점)"
         )
-        self._start_filtered_playback(tmp_path, duration, t0, t1)
+        self._start_filtered_playback_pcm(pcm, sr, duration, t0, t1)
 
-    def _start_filtered_playback(self, tmp_path, duration, t0, t1):
+    def _start_filtered_playback_pcm(self, pcm_data, sr, duration, t0, t1):
         stop_event = threading.Event()
         self._stop_event = stop_event
         self._playing = True
@@ -771,8 +774,8 @@ class AnnotationTool:
                     self.win.after(0, lambda m=error: self._play_status_var.set(f"오류: {m}"))
                 self.win.after(0, lambda g=gen: self._on_playback_done(g))
 
-        self._play_thread = play_wav_async(
-            tmp_path, stop_event, duration, on_done=_on_done
+        self._play_thread = play_numpy_async(
+            pcm_data, sr, stop_event, duration, on_done=_on_done
         )
 
     # ── 우클릭: 팬 (즉시 시각 이동) ──────────────────────
@@ -1040,18 +1043,7 @@ class AnnotationTool:
         volume = self._volume_var.get() / 100.0
         pcm = (segment * 32767 * volume).astype(np.int16)
 
-        # 임시 WAV 파일 생성
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
-        try:
-            with wave.open(tmp_path, 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(sr)
-                wf.writeframes(pcm.tobytes())
-        finally:
-            os.close(tmp_fd)
-
-        self._play_temp_wav = tmp_path
+        self._play_temp_wav = None
 
         # 세션별 stop event
         stop_event = threading.Event()
@@ -1074,7 +1066,7 @@ class AnnotationTool:
         # 플레이헤드 업데이트 시작
         self._update_playhead()
 
-        # 백그라운드 재생
+        # 백그라운드 재생 (인메모리 numpy 재생)
         def _on_play_done(error):
             is_current = (self._play_generation == gen)
             if error and is_current:
@@ -1082,8 +1074,8 @@ class AnnotationTool:
             if is_current:
                 self.win.after(0, lambda g=gen: self._on_playback_done(g))
 
-        self._play_thread = play_wav_async(
-            tmp_path, stop_event, actual_duration, on_done=_on_play_done
+        self._play_thread = play_numpy_async(
+            pcm, sr, stop_event, actual_duration, on_done=_on_play_done
         )
 
     def _stop_playback(self):
@@ -1415,12 +1407,6 @@ class AnnotationTool:
             self._stop_event.set()
             self._playing = False
         self._clear_playhead()
-        # 임시 WAV 파일 삭제
-        if self._play_temp_wav and os.path.exists(self._play_temp_wav):
-            try:
-                os.remove(self._play_temp_wav)
-            except Exception:
-                pass
         self.win.destroy()
 
     def get_annotations(self):

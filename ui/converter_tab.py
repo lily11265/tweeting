@@ -1,5 +1,5 @@
 # ============================================================
-# ConverterTabMixin — MP3 → WAV 변환기 탭
+# ConverterTabMixin — MP3/MP4 → WAV 변환기 탭
 # ============================================================
 
 import subprocess
@@ -8,26 +8,26 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
 
-from audio.sanitizer import convert_mp3_to_wav
+from audio.sanitizer import convert_media_to_wav
 
 
 class ConverterTabMixin:
-    """MP3 → WAV 변환기 탭 메서드 모음 (Mixin)"""
+    """MP3/MP4 → WAV 변환기 탭 메서드 모음 (Mixin)"""
 
     # ----------------------------------------
-    # 탭: MP3 → WAV 변환기
+    # 탭: MP3/MP4 → WAV 변환기
     # ----------------------------------------
     def _build_converter_tab(self, parent):
         # 안내
         frm_info = ttk.Frame(parent, padding=10)
         frm_info.pack(fill="x")
-        ttk.Label(frm_info, text="MP3 파일을 WAV로 변환합니다.",
+        ttk.Label(frm_info, text="MP3/MP4 파일을 WAV로 변환합니다.",
                   font=("Arial", 12, "bold")).pack(anchor="w")
-        ttk.Label(frm_info, text="여러 파일을 한번에 선택하여 일괄 변환할 수 있습니다.",
+        ttk.Label(frm_info, text="여러 파일을 한번에 선택하여 일괄 변환할 수 있습니다. (MP4는 오디오만 추출)",
                   foreground="gray").pack(anchor="w", pady=(2, 0))
 
         # 입력 파일
-        frm_input = ttk.LabelFrame(parent, text=" MP3 파일 선택 ", padding=10)
+        frm_input = ttk.LabelFrame(parent, text=" MP3/MP4 파일 선택 ", padding=10)
         frm_input.pack(fill="x", padx=10, pady=5)
 
         btn_row = ttk.Frame(frm_input)
@@ -83,25 +83,33 @@ class ConverterTabMixin:
         self._conv_files = []
 
     def _conv_add_files(self):
-        files = filedialog.askopenfilenames(filetypes=[("MP3 파일", "*.mp3")])
+        files = filedialog.askopenfilenames(filetypes=[
+            ("MP3/MP4 파일", "*.mp3 *.mp4"),
+            ("MP3 파일", "*.mp3"),
+            ("MP4 파일", "*.mp4"),
+        ])
         for f in files:
             if f not in self._conv_files:
                 self._conv_files.append(f)
                 self.conv_file_listbox.insert("end", f)
 
     def _conv_add_folder(self):
-        """폴더 내 모든 MP3 파일 추가"""
+        """폴더 내 모든 MP3/MP4 파일 추가"""
         folder = filedialog.askdirectory()
         if folder:
             count = 0
-            for f in sorted(Path(folder).glob("*.mp3")):
+            folder_path = Path(folder)
+            media_files = sorted(
+                list(folder_path.glob("*.mp3")) + list(folder_path.glob("*.mp4"))
+            )
+            for f in media_files:
                 fp = str(f)
                 if fp not in self._conv_files:
                     self._conv_files.append(fp)
                     self.conv_file_listbox.insert("end", fp)
                     count += 1
             if count == 0:
-                messagebox.showinfo("안내", "해당 폴더에 MP3 파일이 없습니다.")
+                messagebox.showinfo("안내", "해당 폴더에 MP3/MP4 파일이 없습니다.")
             else:
                 self.conv_status.set(f"{count}개 파일 추가됨")
 
@@ -116,7 +124,7 @@ class ConverterTabMixin:
 
     def _conv_run(self):
         if not self._conv_files:
-            messagebox.showwarning("경고", "변환할 MP3 파일을 추가해 주세요.")
+            messagebox.showwarning("경고", "변환할 MP3/MP4 파일을 추가해 주세요.")
             return
 
         if not self._HAS_PYDUB:
@@ -125,7 +133,7 @@ class ConverterTabMixin:
                 subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
             except FileNotFoundError:
                 messagebox.showerror("오류",
-                    "MP3 변환에 pydub 또는 ffmpeg가 필요합니다.\n\n"
+                    "MP3/MP4 변환에 pydub 또는 ffmpeg가 필요합니다.\n\n"
                     "설치 방법:\n"
                     "  pip install pydub\n"
                     "  + ffmpeg 설치 (https://ffmpeg.org)")
@@ -144,22 +152,22 @@ class ConverterTabMixin:
         success = 0
         fail = 0
 
-        for i, mp3_path in enumerate(self._conv_files):
-            mp3 = Path(mp3_path)
-            self.root.after(0, self._conv_log_msg, f"[{i+1}/{total}] 변환 중: {mp3.name}")
+        for i, media_path in enumerate(self._conv_files):
+            media = Path(media_path)
+            self.root.after(0, self._conv_log_msg, f"[{i+1}/{total}] 변환 중: {media.name}")
             self.root.after(0, self._conv_update_status, f"변환 중... ({i+1}/{total})")
 
             try:
                 # 저장 경로 결정
                 if self.var_conv_same_dir.get():
-                    wav_path = mp3.with_suffix(".wav")
+                    wav_path = media.with_suffix(".wav")
                 else:
                     out_dir = self.var_conv_output_dir.get().strip()
                     if not out_dir:
-                        out_dir = str(mp3.parent)
-                    wav_path = Path(out_dir) / (mp3.stem + ".wav")
+                        out_dir = str(media.parent)
+                    wav_path = Path(out_dir) / (media.stem + ".wav")
 
-                convert_mp3_to_wav(mp3_path, wav_path)
+                convert_media_to_wav(media_path, wav_path)
                 self.root.after(0, self._conv_log_msg, f"  ✅ 완료 → {wav_path}\n")
                 success += 1
             except Exception as e:

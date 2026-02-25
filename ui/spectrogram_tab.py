@@ -29,12 +29,15 @@ except ImportError:
 
 # 오디오 재생 (sounddevice 우선, winsound 폴백)
 from audio.playback import (
-    play_wav_async, stop_playback as _stop_audio,
+    play_wav_async, play_numpy_async, stop_playback as _stop_audio,
     prepare_playback_wav, HAS_PLAYBACK,
 )
 
 # 오디오 필터 (밴드패스, 폴리곤 마스킹)
-from audio.audio_filter import prepare_filtered_wav, prepare_polygon_wav
+from audio.audio_filter import (
+    prepare_filtered_wav, prepare_polygon_wav,
+    prepare_filtered_pcm, prepare_polygon_pcm,
+)
 
 # 모듈 내 참조
 from colormaps import COLORMAPS, MAGMA_LUT, DETECTION_COLORS
@@ -495,7 +498,8 @@ class SpectrogramTab:
         self._detection_items.clear()
 
     def _draw_detections(self):
-        """현재 뷰에 보이는 검출 결과를 캔버스에 오버레이로 표시"""
+        """현재 뷰에 보이는 검출 결과를 캔버스에 오버레이로 표시
+        det_f_low/det_f_high가 있으면 주파수 범위 바운딩 박스, 없으면 전체 높이"""
         self._clear_detection_overlay()
 
         if not self._detections or not self._show_detections:
@@ -512,6 +516,10 @@ class SpectrogramTab:
         if view_dt <= 0:
             return
 
+        view_df = self.f_high - self.f_low
+        if view_df <= 0:
+            return
+
         # 검출 시간 ± 마진 (줌 레벨에 비례)
         margin = max(0.3, view_dt * 0.01)
 
@@ -520,7 +528,7 @@ class SpectrogramTab:
             det_species = det.get("species", "")
             det_score = det.get("score", 0)
 
-            # 검출 범위
+            # 검출 시간 범위
             t0 = det_time - margin
             t1 = det_time + margin
 
@@ -535,34 +543,105 @@ class SpectrogramTab:
             if px_right - px_left < 2:
                 px_right = px_left + 2
 
-            # 종별 색상
-            colors = self._species_colors.get(det_species, DETECTION_COLORS[0])
-            outline_color = colors[0]
+            # ★ 주파수 바운딩 박스 계산
+            has_freq = "det_f_low" in det and "det_f_high" in det
+            if has_freq:
+                # det_f_low/det_f_high는 kHz 단위 → Hz로 변환
+                det_fl = det["det_f_low"] * 1000  # kHz → Hz
+                det_fh = det["det_f_high"] * 1000  # kHz → Hz
 
-            # 반투명 사각형 (전체 높이)
+                # 현재 뷰의 주파수 범위와 교차하는지 확인
+                if det_fh < self.f_low or det_fl > self.f_high:
+                    continue
+
+                # 주파수 → 픽셀 Y 변환 (높은 주파수 = 위 = Y 작음)
+                py_top = max(0, (self.f_high - det_fh) / view_df * ch)
+                py_bottom = min(ch, (self.f_high - det_fl) / view_df * ch)
+
+                # 최소 높이 보장
+                if py_bottom - py_top < 6:
+                    mid = (py_top + py_bottom) / 2
+                    py_top = mid - 3
+                    py_bottom = mid + 3
+            else:
+                # 주파수 정보 없으면 전체 높이 (하위 호환)
+                py_top = 2
+                py_bottom = ch - 2
+
+            # ★ 보색 계산: 바운딩 박스 중심의 배경색에서 HSV 180° 회전
+            outline_color = None
+            try:
+                pil_img = getattr(self, "_last_pil_img", None)
+                if pil_img is not None:
+                    img_w, img_h = pil_img.size
+                    # 바운딩 박스 중심의 이미지 좌표 (캔버스→이미지 비율 변환)
+                    sample_x = int((px_left + px_right) / 2 * img_w / cw)
+                    sample_y = int((py_top + py_bottom) / 2 * img_h / ch)
+                    sample_x = max(0, min(sample_x, img_w - 1))
+                    sample_y = max(0, min(sample_y, img_h - 1))
+
+                    # 중심 5x5 영역 평균 샘플링
+                    r_sum, g_sum, b_sum, count = 0, 0, 0, 0
+                    for dx in range(-2, 3):
+                        for dy in range(-2, 3):
+                            sx = max(0, min(sample_x + dx, img_w - 1))
+                            sy = max(0, min(sample_y + dy, img_h - 1))
+                            px = pil_img.getpixel((sx, sy))
+                            if isinstance(px, (tuple, list)) and len(px) >= 3:
+                                r_sum += px[0]; g_sum += px[1]; b_sum += px[2]
+                                count += 1
+                    if count > 0:
+                        import colorsys
+                        r_avg = r_sum / count / 255.0
+                        g_avg = g_sum / count / 255.0
+                        b_avg = b_sum / count / 255.0
+                        h, s, v = colorsys.rgb_to_hsv(r_avg, g_avg, b_avg)
+                        # 보색: 색상환 180° 회전, 채도/밝기 최대화
+                        h_comp = (h + 0.5) % 1.0
+                        s_comp = max(0.8, s)   # 채도 높게
+                        v_comp = max(0.9, v)   # 밝기 높게
+                        rc, gc, bc = colorsys.hsv_to_rgb(h_comp, s_comp, v_comp)
+                        outline_color = f"#{int(rc*255):02x}{int(gc*255):02x}{int(bc*255):02x}"
+            except Exception:
+                pass
+
+            if outline_color is None:
+                colors = self._species_colors.get(det_species, DETECTION_COLORS[0])
+                outline_color = colors[0]
+
+            # 바운딩 박스 (주파수 범위 또는 전체 높이)
             rect_id = self.canvas.create_rectangle(
-                px_left, 2, px_right, ch - 2,
+                px_left, py_top, px_right, py_bottom,
                 outline=outline_color, width=2,
                 fill="", dash=(4, 2)
             )
             self._detection_items.append(rect_id)
 
-            # 상단 라벨 (종명 + 점수)
+            # 라벨 (종명 + 점수 + 주파수 범위 + 패스)
             label_x = (px_left + px_right) / 2
             score_pct = f"{det_score:.0%}" if isinstance(det_score, float) else str(det_score)
-            label_text = f"{det_species}\n{score_pct}"
+            det_pass = det.get("detection_pass", 1)
+            pass_marker = " [P2]" if det_pass == 2 else ""
+
+            if has_freq:
+                freq_label = f"{det['det_f_low']:.1f}-{det['det_f_high']:.1f}kHz"
+                label_text = f"{det_species}{pass_marker}\n{score_pct}\n{freq_label}"
+            else:
+                label_text = f"{det_species}{pass_marker}\n{score_pct}"
+
+            label_y = max(12, py_top - 4)
             text_id = self.canvas.create_text(
-                label_x, 12, text=label_text,
+                label_x, label_y, text=label_text,
                 fill=outline_color, font=("Arial", 8, "bold"),
-                anchor="n"
+                anchor="s"
             )
             self._detection_items.append(text_id)
 
-            # 중심선 (정확한 검출 시점)
+            # 중심선 (정확한 검출 시점, 바운딩 박스 범위 내)
             px_center = (det_time - self.t_start) / view_dt * cw
             if 0 <= px_center <= cw:
                 line_id = self.canvas.create_line(
-                    px_center, 0, px_center, ch,
+                    px_center, py_top, px_center, py_bottom,
                     fill=outline_color, width=1, dash=(2, 4)
                 )
                 self._detection_items.append(line_id)
@@ -870,17 +949,17 @@ class SpectrogramTab:
         speed = self._play_speed
         volume = self._volume_var.get() / 100.0
 
-        tmp_path, duration = prepare_filtered_wav(
+        pcm, sr, duration = prepare_filtered_pcm(
             self.data, self.sr, t0, t1, f_low, f_high,
             speed=speed, volume=volume
         )
-        if not tmp_path:
+        if pcm is None:
             return
 
         self._play_status_var.set(
             f"📦 박스 재생: {t0:.1f}-{t1:.1f}s, {f_low:.0f}-{f_high:.0f}Hz"
         )
-        self._start_filtered_playback(tmp_path, duration, t0, t1)
+        self._start_filtered_playback_pcm(pcm, sr, duration, t0, t1)
 
     def _play_filtered_polygon(self, points):
         """STFT 마스킹으로 폴리곤 영역 재생"""
@@ -894,11 +973,11 @@ class SpectrogramTab:
         self._play_status_var.set("✏ 폴리곤 필터 처리 중...")
         self.frame.update_idletasks()
 
-        tmp_path, duration = prepare_polygon_wav(
+        pcm, sr, duration = prepare_polygon_pcm(
             self.data, self.sr, points,
             speed=speed, volume=volume
         )
-        if not tmp_path:
+        if pcm is None:
             self._play_status_var.set("")
             return
 
@@ -907,10 +986,10 @@ class SpectrogramTab:
         self._play_status_var.set(
             f"✏ 폴리곤 재생: {t0:.1f}-{t1:.1f}s ({len(points)}점)"
         )
-        self._start_filtered_playback(tmp_path, duration, t0, t1)
+        self._start_filtered_playback_pcm(pcm, sr, duration, t0, t1)
 
-    def _start_filtered_playback(self, tmp_path, duration, t0, t1):
-        """필터링된 WAV 파일을 재생 (공통)"""
+    def _start_filtered_playback_pcm(self, pcm_data, sr, duration, t0, t1):
+        """필터링된 PCM 데이터를 인메모리 재생 (공통)"""
         stop_event = threading.Event()
         self._stop_event = stop_event
         self._playing = True
@@ -932,8 +1011,8 @@ class SpectrogramTab:
                     self.frame.after(0, lambda m=error: self._play_status_var.set(f"오류: {m}"))
                 self.frame.after(0, lambda g=gen: self._on_playback_done(g))
 
-        self._play_thread = play_wav_async(
-            tmp_path, stop_event, duration, on_done=_on_done
+        self._play_thread = play_numpy_async(
+            pcm_data, sr, stop_event, duration, on_done=_on_done
         )
 
     def _on_resize(self, event):
@@ -1149,18 +1228,7 @@ class SpectrogramTab:
         volume = self._volume_var.get() / 100.0
         pcm = (segment * 32767 * volume).astype(np.int16)
 
-        # 임시 WAV 파일 생성
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
-        try:
-            with wave.open(tmp_path, 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(sr)
-                wf.writeframes(pcm.tobytes())
-        finally:
-            os.close(tmp_fd)
-
-        self._play_temp_wav = tmp_path
+        self._play_temp_wav = None
 
         # 세션별 stop event
         stop_event = threading.Event()
@@ -1183,7 +1251,7 @@ class SpectrogramTab:
         # 플레이헤드 업데이트 시작
         self._update_playhead()
 
-        # 백그라운드 재생 (audio.playback 모듈 사용)
+        # 백그라운드 재생 (인메모리 numpy 재생)
         def _on_play_done(error):
             is_current = (self._play_generation == gen)
             if error and is_current:
@@ -1191,8 +1259,8 @@ class SpectrogramTab:
             if is_current:
                 self.frame.after(0, lambda g=gen: self._on_playback_done(g))
 
-        self._play_thread = play_wav_async(
-            tmp_path, stop_event, actual_duration, on_done=_on_play_done
+        self._play_thread = play_numpy_async(
+            pcm, sr, stop_event, actual_duration, on_done=_on_play_done
         )
 
     def _stop_playback(self):

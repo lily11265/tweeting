@@ -107,13 +107,90 @@ def run_birdnet_prediction(
 ) -> List[dict]:
     """
     BirdNET으로 WAV 파일을 분석하여 annotation 형식으로 반환.
-    Windows 호환을 위해 서브프로세스에서 실행.
+    - 개발 모드: 서브프로세스에서 실행 (sys.executable = python)
+    - PyInstaller 번들 모드: 인프로세스 실행 (sys.executable = .exe)
     """
     if not HAS_BIRDNET:
         raise RuntimeError(
             "BirdNET이 설치되지 않았습니다.\n"
             "설치: pip install birdnet"
         )
+
+    is_frozen = getattr(sys, 'frozen', False)
+
+    if is_frozen:
+        # ── PyInstaller 번들 모드: 인프로세스 실행 ──
+        return _run_birdnet_inprocess(
+            wav_path, confidence_threshold, lang, progress_callback
+        )
+    else:
+        # ── 개발 모드: 서브프로세스 실행 ──
+        return _run_birdnet_subprocess(
+            wav_path, confidence_threshold, lang, progress_callback
+        )
+
+
+def _run_birdnet_inprocess(
+    wav_path: str,
+    confidence_threshold: float,
+    lang: str,
+    progress_callback: Optional[Callable[[str], None]],
+) -> List[dict]:
+    """PyInstaller 번들일 때 인프로세스로 BirdNET 실행."""
+    import birdnet
+
+    if progress_callback:
+        progress_callback("BirdNET 모델 로딩 중...")
+
+    model = birdnet.load("acoustic", "2.4", "tf", lang=lang)
+
+    if progress_callback:
+        progress_callback(f"'{os.path.basename(wav_path)}' 분석 중...")
+
+    predictions = model.predict(
+        os.path.abspath(wav_path),
+        default_confidence_threshold=confidence_threshold,
+        n_workers=1,
+    )
+
+    if progress_callback:
+        progress_callback("결과 변환 중...")
+
+    arr = predictions.to_structured_array()
+    filename = os.path.basename(wav_path)
+
+    results = []
+    for row in arr:
+        species_raw = str(row["species_name"])
+        conf = float(row["confidence"])
+        species = species_raw.split("_", 1)[1] if "_" in species_raw else species_raw
+
+        t_start = _parse_time(str(row["start_time"]))
+        t_end = _parse_time(str(row["end_time"]))
+
+        results.append({
+            "file": filename,
+            "t_start": round(t_start, 4),
+            "t_end": round(t_end, 4),
+            "f_low": 0,
+            "f_high": 24000,
+            "species": species,
+            "confidence": round(conf, 4),
+        })
+
+    if progress_callback:
+        progress_callback(f"완료: {len(results)}건 검출")
+
+    return results
+
+
+def _run_birdnet_subprocess(
+    wav_path: str,
+    confidence_threshold: float,
+    lang: str,
+    progress_callback: Optional[Callable[[str], None]],
+) -> List[dict]:
+    """개발 모드: 서브프로세스에서 BirdNET 실행."""
 
     print(f"[BirdNET] === 시작 ===")
     print(f"[BirdNET] wav_path: {wav_path}")

@@ -143,6 +143,68 @@ def play_wav_async(wav_path, stop_event, duration, on_done=None):
     return thread
 
 
+def play_numpy_async(pcm_data, sr, stop_event, duration, on_done=None):
+    """
+    numpy PCM 배열을 비동기 재생합니다 (WAV 파일 생성 없음).
+
+    sounddevice 백엔드: numpy 배열 직접 재생 (디스크 I/O 없음)
+    winsound 폴백: 임시 WAV 파일 생성 후 재생 → 완료 시 삭제
+
+    Args:
+        pcm_data: int16 numpy 배열
+        sr: 샘플 레이트
+        stop_event: threading.Event — set 시 재생 중단
+        duration: 예상 재생 시간 (초)
+        on_done: 재생 완료 콜백 (에러 메시지 또는 None)
+    """
+    if not HAS_PLAYBACK:
+        if on_done:
+            on_done("오디오 재생 백엔드를 사용할 수 없습니다.\n"
+                    "pip install sounddevice soundfile")
+        return
+
+    def _worker():
+        error = None
+        tmp_path = None
+        try:
+            if _BACKEND == "sounddevice":
+                # sounddevice: numpy 배열 직접 재생 (WAV 파일 불필요)
+                float_data = pcm_data.astype(np.float32) / 32767.0
+                sd.play(float_data, sr)
+                end_wall = time.time() + duration + 0.3
+                while time.time() < end_wall and not stop_event.is_set():
+                    time.sleep(0.05)
+                if stop_event.is_set():
+                    sd.stop()
+            else:
+                # winsound 폴백: 임시 WAV 필요
+                tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+                try:
+                    with wave.open(tmp_path, 'wb') as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(sr)
+                        wf.writeframes(pcm_data.tobytes())
+                finally:
+                    os.close(tmp_fd)
+                _play_winsound(tmp_path, stop_event, duration)
+        except Exception as e:
+            error = str(e)
+        finally:
+            # winsound 폴백 시 임시 파일 정리
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+            if on_done:
+                on_done(error)
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    return thread
+
+
 def stop_playback():
     """현재 재생을 중지합니다."""
     if _BACKEND == "sounddevice":

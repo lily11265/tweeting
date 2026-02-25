@@ -28,12 +28,15 @@ except ImportError:
 
 # 오디오 재생
 from audio.playback import (
-    play_wav_async, stop_playback as _stop_audio,
+    play_wav_async, play_numpy_async, stop_playback as _stop_audio,
     prepare_playback_wav, HAS_PLAYBACK,
 )
 
 # 오디오 필터
-from audio.audio_filter import prepare_filtered_wav, prepare_polygon_wav
+from audio.audio_filter import (
+    prepare_filtered_wav, prepare_polygon_wav,
+    prepare_filtered_pcm, prepare_polygon_pcm,
+)
 
 # 모듈 내 참조
 from colormaps import COLORMAPS
@@ -934,18 +937,8 @@ class TemplateSelector:
             segment = segment / max_val
         pcm = (segment * 32767 * volume).astype(np.int16)
 
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
-        try:
-            with wave.open(tmp_path, 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(tab.sr)
-                wf.writeframes(pcm.tobytes())
-        finally:
-            os.close(tmp_fd)
-
         actual_duration = (t1 - t0) / speed
-        self._do_play(tmp_path, actual_duration, t0, t1, tab_idx)
+        self._do_play_pcm(pcm, tab.sr, actual_duration, t0, t1, tab_idx)
 
     def _play_filtered_box(self, tab_idx, t0, t1, f_low, f_high):
         tab = self._tabs[tab_idx]
@@ -954,16 +947,16 @@ class TemplateSelector:
         self._stop_playback()
         speed = self._play_speed
         volume = self._volume_var.get() / 100.0
-        tmp_path, duration = prepare_filtered_wav(
+        pcm, sr, duration = prepare_filtered_pcm(
             tab.data, tab.sr, t0, t1, f_low, f_high,
             speed=speed, volume=volume
         )
-        if not tmp_path:
+        if pcm is None:
             return
         self._play_status_var.set(
             f"📦 박스: {t0:.1f}-{t1:.1f}s, {f_low:.0f}-{f_high:.0f}Hz"
         )
-        self._do_play(tmp_path, duration, t0, t1, tab_idx)
+        self._do_play_pcm(pcm, sr, duration, t0, t1, tab_idx)
 
     def _play_filtered_polygon(self, tab_idx, points):
         tab = self._tabs[tab_idx]
@@ -974,11 +967,11 @@ class TemplateSelector:
         volume = self._volume_var.get() / 100.0
         self._play_status_var.set("✏ 폴리곤 처리 중...")
         self.win.update_idletasks()
-        tmp_path, duration = prepare_polygon_wav(
+        pcm, sr, duration = prepare_polygon_pcm(
             tab.data, tab.sr, points,
             speed=speed, volume=volume
         )
-        if not tmp_path:
+        if pcm is None:
             self._play_status_var.set("")
             return
         times = [p[0] for p in points]
@@ -986,10 +979,10 @@ class TemplateSelector:
         self._play_status_var.set(
             f"✏ 폴리곤: {t0:.1f}-{t1:.1f}s ({len(points)}점)"
         )
-        self._do_play(tmp_path, duration, t0, t1, tab_idx)
+        self._do_play_pcm(pcm, sr, duration, t0, t1, tab_idx)
 
-    def _do_play(self, tmp_path, duration, t0, t1, tab_idx):
-        """WAV 파일 재생 공통"""
+    def _do_play_pcm(self, pcm_data, sr, duration, t0, t1, tab_idx):
+        """인메모리 PCM 재생 공통"""
         stop_event = threading.Event()
         self._stop_event = stop_event
         self._playing = True
@@ -1011,8 +1004,8 @@ class TemplateSelector:
                     self.win.after(0, lambda m=error: self._play_status_var.set(f"오류: {m}"))
                 self.win.after(0, lambda: self._on_playback_done(gen))
 
-        self._play_thread = play_wav_async(
-            tmp_path, stop_event, duration, on_done=_on_done
+        self._play_thread = play_numpy_async(
+            pcm_data, sr, stop_event, duration, on_done=_on_done
         )
 
     def _stop_playback(self):

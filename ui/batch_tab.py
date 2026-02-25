@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import traceback
 import tkinter as tk
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
 from collections import defaultdict
@@ -17,6 +18,7 @@ from collections import defaultdict
 from audio.sanitizer import ensure_wav, AUDIO_FILETYPES
 from ui.spectrogram_tab import SpectrogramTab as _SpectrogramTab
 from ui.species_form import create_species_form
+from parallel_runner import run_single_analysis
 
 
 class BatchTabMixin:
@@ -121,8 +123,15 @@ class BatchTabMixin:
         self.batch_progress = ttk.Progressbar(frm_run, mode="determinate", length=250)
         self.batch_progress.pack(side="left", padx=10, fill="x", expand=True)
 
+        # 병렬 워커 수
+        ttk.Label(frm_run, text="워커:").pack(side="right", padx=(5, 2))
+        self.batch_workers_var = tk.IntVar(value=min(4, max(1, os.cpu_count() or 1)))
+        ttk.Spinbox(frm_run, textvariable=self.batch_workers_var,
+                    from_=1, to=os.cpu_count() or 4,
+                    width=3).pack(side="right")
+
         self.batch_status_var = tk.StringVar(value="대기 중")
-        ttk.Label(frm_run, textvariable=self.batch_status_var).pack(side="right")
+        ttk.Label(frm_run, textvariable=self.batch_status_var).pack(side="right", padx=5)
 
         # 결과 텍스트
         frm_result = ttk.LabelFrame(parent, text=" 5. 배치 결과 ", padding=5)
@@ -212,6 +221,7 @@ class BatchTabMixin:
                 "name":   sp["name"].get().strip(),
                 "cutoff": sp["cutoff"].get(),
                 "templates": [],
+                "ensemble_strategy": sp.get("ensemble", tk.StringVar(value="max")).get(),
             }
             # C5: 멀티 템플릿 수집
             for tmpl in sp["templates"]:
@@ -267,11 +277,11 @@ class BatchTabMixin:
         self.batch_result_text.see("end")
 
     def _batch_worker(self, audio_files, species_data):
-        """배경 스레드에서 각 음원별로 R 분석 실행"""
+        """ProcessPoolExecutor 기반 병렬 분석"""
         total = len(audio_files)
         batch_output_base = Path(tempfile.mkdtemp(prefix="birdsong_batch_"))
+        self._created_temp_dirs.append(str(batch_output_base))
 
-        # Rscript 확인
         if not self.rscript_path:
             self.root.after(0, lambda: messagebox.showerror("오류",
                 "Rscript를 찾을 수 없습니다.\n\n"
@@ -282,154 +292,104 @@ class BatchTabMixin:
         global_weights = {
             k: v.get() for k, v in self.batch_weight_vars.items()
         }
+        max_workers = self.batch_workers_var.get()
 
-        for i, audio_file in enumerate(audio_files):
-            if self._batch_cancel:
-                self.root.after(0, self._batch_log,
-                    f"\n⛔ 사용자에 의해 중단됨 ({i}/{total} 완료)\n")
-                break
+        self.root.after(0, self._batch_log,
+            f"배치 분석 시작: {total}개 파일, 워커 {max_workers}개\n")
 
-            basename = os.path.basename(audio_file)
-            self.root.after(0, lambda b=basename, idx=i: (
-                self.batch_status_var.set(f"{idx+1}/{total}: {b}"),
-                self.batch_progress.configure(value=idx)
-            ))
-            self.root.after(0, self._batch_log,
-                f"\n{'='*60}\n  [{i+1}/{total}] {basename}\n{'='*60}\n")
+        # 작업 제출
+        futures_map = {}  # future -> (index, audio_file)
+        completed = 0
 
-            try:
-                # 1) 음원별 출력 폴더 생성
-                sub_dir = batch_output_base / f"batch_{i+1:04d}"
-                sub_dir.mkdir(parents=True, exist_ok=True)
-
-                # 2) 전체 음원 WAV 전처리 (sanitize)
-                self.root.after(0, self._batch_log, "  [Python 전처리]\n")
-                try:
-                    main_wav, main_log = ensure_wav(audio_file, sub_dir)
-                    for line in main_log.splitlines():
-                        self.root.after(0, self._batch_log, f"    {line}\n")
-                except Exception as e:
-                    self.root.after(0, self._batch_log,
-                        f"    ⚠ 전체 음원 전처리 실패: {e}\n")
-                    self.root.after(0, self._batch_log,
-                        f"    {traceback.format_exc()}\n")
-                    continue
-
-                # WAV 경로 저장 (스펙트로그램 뷰어용)
-                self._batch_wav_map[basename] = main_wav
-
-                # 3) C5: 템플릿별 음원 전처리
-                sp_data_copy = []
-                for sp in species_data:
-                    sp_copy = {k: v for k, v in sp.items() if k != "templates"}
-                    sp_copy["templates"] = []
-                    for tmpl in sp["templates"]:
-                        tmpl_copy = dict(tmpl)
-                        try:
-                            sp_wav, sp_log = ensure_wav(tmpl["wav_path"], sub_dir)
-                            tmpl_copy["wav_path"] = sp_wav
-                            for line in sp_log.splitlines():
-                                self.root.after(0, self._batch_log, f"    {line}\n")
-                        except Exception as e:
-                            self.root.after(0, self._batch_log,
-                                f"    ⚠ {sp.get('name','?')}/{tmpl.get('label','?')} 전처리 실패: {e}\n")
-                        sp_copy["templates"].append(tmpl_copy)
-                    sp_data_copy.append(sp_copy)
-
-                # 4) config.json 생성
-                config = {
-                    "main_wav":   main_wav,
-                    "output_dir": str(sub_dir),
-                    "weights":    global_weights,
-                    "species":    sp_data_copy,
-                }
-                config_path = sub_dir / "config.json"
-                with open(config_path, "w", encoding="utf-8") as f:
-                    json.dump(config, f, ensure_ascii=False, indent=2)
-
-                self.root.after(0, self._batch_log,
-                    f"  [R 분석 실행]\n"
-                    f"    config: {config_path}\n"
-                    f"    main_wav: {main_wav}\n")
-
-                # 5) Rscript 실행
-                result = subprocess.run(
-                    [self.rscript_path, "--encoding=UTF-8",
-                     str(self.r_script), str(config_path)],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            for i, audio_file in enumerate(audio_files):
+                if self._batch_cancel:
+                    break
+                sub_dir = str(batch_output_base / f"batch_{i+1:04d}")
+                future = executor.submit(
+                    run_single_analysis,
+                    rscript_path=self.rscript_path,
+                    r_script=str(self.r_script),
+                    audio_file=audio_file,
+                    species_data=species_data,
+                    global_weights=global_weights,
+                    output_dir=sub_dir,
+                    extra_config={},
                     timeout=600,
                 )
+                futures_map[future] = (i, audio_file)
 
-                # 디버그 로그 항상 저장
-                log_path = sub_dir / "debug_log.txt"
+            # 결과 수집
+            for future in as_completed(futures_map):
+                if self._batch_cancel:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    self.root.after(0, self._batch_log,
+                        f"\n⛔ 사용자에 의해 중단됨 ({completed}/{total} 완료)\n")
+                    break
+
+                idx, audio_file = futures_map[future]
+                basename = Path(audio_file).name
+                completed += 1
+
+                self.root.after(0, lambda c=completed, b=basename: (
+                    self.batch_status_var.set(f"{c}/{total}: {b}"),
+                    self.batch_progress.configure(value=c)
+                ))
+
                 try:
-                    with open(log_path, "w", encoding="utf-8") as f:
-                        f.write(f"=== R 실행 결과 (코드: {result.returncode}) ===\n\n")
-                        f.write(f"--- stdout ---\n{result.stdout or '(없음)'}\n\n")
-                        f.write(f"--- stderr ---\n{result.stderr or '(없음)'}\n")
-                except Exception:
-                    pass
-
-                if result.returncode != 0:
+                    res = future.result()
+                except Exception as e:
                     self.root.after(0, self._batch_log,
-                        f"  ⚠ R 오류 (코드: {result.returncode})\n")
-
-                    # === stdout 전체 출력 ===
-                    if result.stdout:
-                        stdout_lines = result.stdout.strip().splitlines()
-                        self.root.after(0, self._batch_log,
-                            f"  --- R stdout ({len(stdout_lines)}줄) ---\n")
-                        for line in stdout_lines:
-                            self.root.after(0, self._batch_log,
-                                f"  {line}\n")
-
-                    # === stderr 전체 출력 ===
-                    if result.stderr:
-                        stderr_lines = result.stderr.strip().splitlines()
-                        self.root.after(0, self._batch_log,
-                            f"  --- R stderr ({len(stderr_lines)}줄) ---\n")
-                        for line in stderr_lines:
-                            self.root.after(0, self._batch_log,
-                                f"  {line}\n")
-
-                    if not result.stdout and not result.stderr:
-                        self.root.after(0, self._batch_log,
-                            f"  (R 출력 없음)\n")
-
-                    self.root.after(0, self._batch_log,
-                        f"  📄 상세 로그: {log_path}\n")
+                        f"\n{'='*60}\n  [{idx+1}/{total}] {basename}\n"
+                        f"  ⚠ 워커 예외: {e}\n{'='*60}\n")
                     continue
 
-                # ✅ 성공 시에도 주요 R 로그 표시
-                if result.stdout:
+                self.root.after(0, self._batch_log,
+                    f"\n{'='*60}\n  [{idx+1}/{total}] {basename}\n{'='*60}\n")
+
+                # WAV 경로 저장 (스펙트로그램 뷰어용)
+                self._batch_wav_map[basename] = res.get("audio_file", audio_file)
+
+                if res.get("error"):
+                    self.root.after(0, self._batch_log,
+                        f"  ⚠ 오류: {res['error']}\n")
+                    continue
+
+                if res["returncode"] != 0:
+                    self.root.after(0, self._batch_log,
+                        f"  ⚠ R 오류 (코드: {res['returncode']})\n")
+                    if res["stdout"]:
+                        for line in res["stdout"].strip().splitlines()[-5:]:
+                            self.root.after(0, self._batch_log, f"  {line}\n")
+                    if res["stderr"]:
+                        for line in res["stderr"].strip().splitlines()[-5:]:
+                            self.root.after(0, self._batch_log, f"  {line}\n")
+                    continue
+
+                # ✅ 성공: R 로그 요약
+                if res["stdout"]:
                     info_lines = [
-                        l for l in result.stdout.splitlines()
+                        l for l in res["stdout"].splitlines()
                         if any(k in l for k in ["[INFO]", "[ERROR]", "★", "검출", "완료", "cutoff"])
                     ]
-                    if info_lines:
-                        for line in info_lines[-10:]:  # 마지막 10줄
-                            self.root.after(0, self._batch_log,
-                                f"  {line.strip()}\n")
+                    for line in info_lines[-10:]:
+                        self.root.after(0, self._batch_log, f"  {line.strip()}\n")
 
-                # 6) 결과 CSV 수집
-                csv_path = sub_dir / "results_detailed.csv"
+                # CSV 결과 수집
+                csv_path = Path(res["output_dir"]) / "results_detailed.csv"
                 if not csv_path.exists():
-                    csv_path = sub_dir / "results.csv"
+                    csv_path = Path(res["output_dir"]) / "results.csv"
 
                 if csv_path.exists():
                     with open(csv_path, "r", encoding="utf-8") as f:
                         reader = csv.DictReader(f)
                         rows = list(reader)
 
-                    detect_count = len(rows)
                     for row in rows:
                         row["source_file"] = basename
                         self._batch_results.append(row)
 
-                    # 결과 요약 표시
-                    if detect_count > 0:
+                    if rows:
                         by_sp = defaultdict(list)
                         for r in rows:
                             by_sp[r.get("species", "?")].append(r)
@@ -442,19 +402,9 @@ class BatchTabMixin:
                             self.root.after(0, self._batch_log,
                                 f"  ✅ {sp_name}: {len(dets)}건 ({times}{suffix})\n")
                     else:
-                        self.root.after(0, self._batch_log,
-                            f"  검출 없음\n")
+                        self.root.after(0, self._batch_log, f"  검출 없음\n")
                 else:
-                    self.root.after(0, self._batch_log,
-                        f"  결과 파일 없음\n")
-
-            except subprocess.TimeoutExpired:
-                self.root.after(0, self._batch_log,
-                    f"  ⚠ 분석 시간 초과 (10분)\n")
-            except Exception as e:
-                self.root.after(0, self._batch_log,
-                    f"  ⚠ Python 오류: {e}\n"
-                    f"  {traceback.format_exc()}\n")
+                    self.root.after(0, self._batch_log, f"  결과 파일 없음\n")
 
         # 완료
         self.root.after(0, lambda: self.batch_progress.configure(value=total))

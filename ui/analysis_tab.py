@@ -99,6 +99,18 @@ class AnalysisTabMixin:
         frm_bottom = ttk.Frame(parent)
         frm_bottom.pack(fill="x", padx=10, pady=5)
 
+        self.freq_filter_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm_bottom, text="🔀 주파수 필터링",
+                        variable=self.freq_filter_var).pack(side="left", padx=(0, 8))
+
+        self.staged_eval_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frm_bottom, text="⚡ 단계적 평가",
+                        variable=self.staged_eval_var).pack(side="left", padx=(0, 8))
+
+        self.parallel_species_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm_bottom, text="🔀 종별 병렬",
+                        variable=self.parallel_species_var).pack(side="left", padx=(0, 8))
+
         self.btn_run = ttk.Button(frm_bottom, text="🔍 분석 실행", command=self._run_analysis)
         self.btn_run.pack(side="left")
 
@@ -259,6 +271,7 @@ class AnalysisTabMixin:
         """자동 튜닝 워커 스레드"""
         try:
             tune_dir = Path(tempfile.mkdtemp(prefix="birdsong_tune_"))
+            self._created_temp_dirs.append(str(tune_dir))
 
             # MP3→WAV 변환 + sanitize
             for sp in species_data:
@@ -500,6 +513,7 @@ class AnalysisTabMixin:
         if file_path.lower().endswith(".mp3"):
             try:
                 tmp_dir = Path(tempfile.mkdtemp(prefix="birdsong_sel_"))
+                self._created_temp_dirs.append(str(tmp_dir))
                 wav_path, _log = ensure_wav(file_path, tmp_dir)
             except Exception as e:
                 messagebox.showerror("변환 오류", f"MP3→WAV 변환 실패:\n{e}")
@@ -508,6 +522,7 @@ class AnalysisTabMixin:
             # WAV도 sanitize (template selector에서는 임시 폴더 사용)
             try:
                 tmp_dir = Path(tempfile.mkdtemp(prefix="birdsong_sel_"))
+                self._created_temp_dirs.append(str(tmp_dir))
                 wav_path, _log = ensure_wav(file_path, tmp_dir)
             except Exception:
                 wav_path = file_path  # sanitize 실패 시 원본 사용
@@ -531,6 +546,7 @@ class AnalysisTabMixin:
         file_list = []           # [(original_path, display_name), ...]
         wav_map = {}             # original_path → converted_wav_path
         tmp_dir = Path(tempfile.mkdtemp(prefix="birdsong_msel_"))
+        self._created_temp_dirs.append(str(tmp_dir))
 
         for tmpl in sp_info["templates"]:
             fp = tmpl["path"].get().strip()
@@ -625,6 +641,7 @@ class AnalysisTabMixin:
                 "name":   sp["name"].get().strip(),
                 "cutoff": sp["cutoff"].get(),
                 "templates": [],
+                "ensemble_strategy": sp.get("ensemble", tk.StringVar(value="max")).get(),
             }
             # C5: 멀티 템플릿 수집
             for tmpl in sp["templates"]:
@@ -696,15 +713,28 @@ class AnalysisTabMixin:
                     "설치 경로 예: C:\\Program Files\\R\\R-x.x.x\\bin")
                 return
 
-            # 설정 JSON 생성 (종합 판별 가중치 포함)
             global_weights = {
                 k: v.get() for k, v in self.weight_vars.items()
             }
+            extra_config = {
+                "freq_filter_enabled": self.freq_filter_var.get(),
+                "staged_eval": self.staged_eval_var.get(),
+            }
+
+            # ★ 종별 병렬 분석 분기
+            if (self.parallel_species_var.get()
+                    and len(species_data) > 1):
+                self._run_parallel_species(
+                    main_wav, species_data, global_weights, extra_config)
+                return
+
+            # ── 기존 순차 분석 ──
             config = {
                 "main_wav":   main_wav,
                 "output_dir": str(self.output_dir),
                 "weights":    global_weights,
                 "species":    species_data,
+                **extra_config,
             }
             config_path = self.output_dir / "config.json"
             with open(config_path, "w", encoding="utf-8") as f:
@@ -755,6 +785,161 @@ class AnalysisTabMixin:
             self.root.after(0, self._on_r_error, "분석 시간이 10분을 초과했습니다.")
         except Exception as e:
             self.root.after(0, self._on_r_error, str(e))
+
+    def _run_parallel_species(self, main_wav, species_data, global_weights, extra_config):
+        """종별 병렬 분석: 종마다 별도 R 프로세스를 실행하고 결과를 병합"""
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from parallel_runner import run_single_analysis
+
+        n_species = len(species_data)
+        self.root.after(0, self._log,
+            f"★ 종별 병렬 분석 시작 ({n_species}종, 워커 {n_species}개)\n\n")
+
+        futures_map = {}
+        merged_stdout = []
+
+        try:
+            with ProcessPoolExecutor(max_workers=n_species) as executor:
+                for i, sp in enumerate(species_data):
+                    sp_dir = str(self.output_dir / f"species_{i+1:02d}_{sp['name']}")
+                    future = executor.submit(
+                        run_single_analysis,
+                        rscript_path=self.rscript_path,
+                        r_script=str(self.r_script),
+                        audio_file=main_wav,
+                        species_data=[sp],       # 단일 종만 전달
+                        global_weights=global_weights,
+                        output_dir=sp_dir,
+                        extra_config=extra_config,
+                        timeout=600,
+                    )
+                    futures_map[future] = (i, sp["name"])
+
+                completed = 0
+                all_results_ok = True
+                for future in as_completed(futures_map):
+                    idx, sp_name = futures_map[future]
+                    completed += 1
+                    self.root.after(0, self._update_progress, completed, n_species)
+
+                    try:
+                        res = future.result()
+                    except Exception as e:
+                        self.root.after(0, self._log,
+                            f"  ⚠ {sp_name} 워커 예외: {e}\n")
+                        all_results_ok = False
+                        continue
+
+                    if res.get("error"):
+                        self.root.after(0, self._log,
+                            f"  ⚠ {sp_name}: {res['error']}\n")
+                        all_results_ok = False
+                    elif res["returncode"] != 0:
+                        self.root.after(0, self._log,
+                            f"  ⚠ {sp_name}: R 오류 (코드 {res['returncode']})\n")
+                        if res["stderr"]:
+                            for line in res["stderr"].strip().splitlines()[-3:]:
+                                self.root.after(0, self._log, f"    {line}\n")
+                        all_results_ok = False
+                    else:
+                        self.root.after(0, self._log,
+                            f"  ✅ {sp_name} 분석 완료\n")
+                        if res["stdout"]:
+                            # 주요 로그만 추출
+                            info = [
+                                l for l in res["stdout"].splitlines()
+                                if any(k in l for k in ["★", "검출", "cutoff", "Staged", "앙상블"])
+                            ]
+                            for line in info[-8:]:
+                                self.root.after(0, self._log, f"    {line.strip()}\n")
+                            merged_stdout.append(res["stdout"])
+
+            # 결과 CSV 병합
+            import csv as csv_mod
+            merged_rows = []
+            for i, sp in enumerate(species_data):
+                sp_dir = self.output_dir / f"species_{i+1:02d}_{sp['name']}"
+                for csv_name in ["results_detailed.csv", "results.csv"]:
+                    csv_path = sp_dir / csv_name
+                    if csv_path.exists():
+                        with open(csv_path, "r", encoding="utf-8") as f:
+                            merged_rows.extend(list(csv_mod.DictReader(f)))
+                        break
+
+            # 병합 CSV 저장
+            if merged_rows:
+                all_keys = set()
+                for row in merged_rows:
+                    all_keys.update(row.keys())
+                ordered_cols = ["species", "time", "time_display", "composite",
+                               "cor_score", "mfcc_score", "dtw_freq", "dtw_env",
+                               "band_energy", "harmonic_ratio", "snr"]
+                final_cols = [c for c in ordered_cols if c in all_keys]
+                final_cols += sorted(all_keys - set(final_cols))
+
+                # results_detailed.csv (전체 컬럼)
+                with open(self.output_dir / "results_detailed.csv",
+                          "w", encoding="utf-8", newline="") as f:
+                    writer = csv_mod.DictWriter(f, fieldnames=final_cols,
+                                                 extrasaction="ignore")
+                    writer.writeheader()
+                    for row in merged_rows:
+                        writer.writerow(row)
+
+                # results.csv (전체 컬럼 — 스펙트로그램 뷰어가 det_f_low/det_f_high 필요)
+                # score 필드 보충: 뷰어가 score 컬럼을 읽음
+                for row in merged_rows:
+                    if "score" not in row and "composite" in row:
+                        row["score"] = row["composite"]
+                csv_cols = final_cols if "score" in final_cols else final_cols + ["score"]
+                with open(self.output_dir / "results.csv",
+                          "w", encoding="utf-8", newline="") as f:
+                    writer = csv_mod.DictWriter(f, fieldnames=csv_cols,
+                                                 extrasaction="ignore")
+                    writer.writeheader()
+                    for row in merged_rows:
+                        writer.writerow(row)
+
+            # results.json 병합
+            merged_json = []
+            for i, sp in enumerate(species_data):
+                sp_dir = self.output_dir / f"species_{i+1:02d}_{sp['name']}"
+                json_path = sp_dir / "results.json"
+                if json_path.exists():
+                    try:
+                        with open(json_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                            if isinstance(data, list):
+                                merged_json.extend(data)
+                            elif isinstance(data, dict):
+                                merged_json.append(data)
+                    except Exception:
+                        pass
+            if merged_json:
+                with open(self.output_dir / "results.json",
+                          "w", encoding="utf-8") as f:
+                    json.dump(merged_json, f, ensure_ascii=False, indent=2)
+
+            # config.json 생성 — 스펙트로그램 뷰어가 WAV 경로를 찾는 데 사용
+            viewer_config = {
+                "main_wav": main_wav,
+                "species": [
+                    {"name": sp["name"], "wav_path": sp["templates"][0]["wav_path"]}
+                    for sp in species_data
+                    if sp.get("templates")
+                ],
+            }
+            with open(self.output_dir / "config.json",
+                      "w", encoding="utf-8") as f:
+                json.dump(viewer_config, f, ensure_ascii=False, indent=2)
+
+            # 전체 stdout 병합
+            full_stdout = "\n".join(merged_stdout)
+            self.root.after(0, self._on_r_output, full_stdout, "", 0)
+
+        except Exception as e:
+            self.root.after(0, self._on_r_error,
+                f"종별 병렬 분석 실패: {e}")
 
     def _log(self, msg):
         self.txt_result.insert("end", msg)
@@ -835,11 +1020,23 @@ class AnalysisTabMixin:
                     reader = csv.DictReader(f)
                     detections = []
                     for row in reader:
-                        detections.append({
+                        det_entry = {
                             "species": row.get("species", ""),
                             "time": float(row.get("time", 0)),
                             "score": float(row.get("score", 0)),
-                        })
+                        }
+                        if row.get("det_f_low") and row.get("det_f_high"):
+                            try:
+                                det_entry["det_f_low"] = float(row["det_f_low"])
+                                det_entry["det_f_high"] = float(row["det_f_high"])
+                            except (ValueError, TypeError):
+                                pass
+                        if row.get("detection_pass"):
+                            try:
+                                det_entry["detection_pass"] = int(row["detection_pass"])
+                            except (ValueError, TypeError):
+                                pass
+                        detections.append(det_entry)
             except Exception:
                 detections = None
 
@@ -949,10 +1146,19 @@ class AnalysisTabMixin:
                 if use_detailed and "composite" in detections[0]:
                     self.txt_result.insert("end",
                         f"  {'시간':>10}  {'종합':>6}  {'corM':>6}  {'MFCC':>6}  "
-                        f"{'freq':>6}  {'env':>6}  {'band':>6}\n")
+                        f"{'freq':>6}  {'env':>6}  {'band':>6}  {'주파수범위':>12}\n")
                     self.txt_result.insert("end", f"  {'-'*10}  {'-'*6}  "
-                        f"{'-'*6}  {'-'*6}  {'-'*6}  {'-'*6}  {'-'*6}\n")
+                        f"{'-'*6}  {'-'*6}  {'-'*6}  {'-'*6}  {'-'*6}  {'-'*12}\n")
                     for det in detections:
+                        # 주파수 범위 표시 (kHz)
+                        freq_str = ""
+                        if det.get('det_f_low') and det.get('det_f_high'):
+                            try:
+                                fl = float(det['det_f_low'])
+                                fh = float(det['det_f_high'])
+                                freq_str = f"{fl:.1f}-{fh:.1f}kHz"
+                            except (ValueError, TypeError):
+                                pass
                         self.txt_result.insert("end",
                             f"  {det['time_display']:>10}  "
                             f"{float(det.get('composite', 0)):>6.3f}  "
@@ -960,7 +1166,8 @@ class AnalysisTabMixin:
                             f"{float(det.get('mfcc_score', 0)):>6.3f}  "
                             f"{float(det.get('dtw_freq', 0)):>6.3f}  "
                             f"{float(det.get('dtw_env', 0)):>6.3f}  "
-                            f"{float(det.get('band_energy', 0)):>6.3f}\n")
+                            f"{float(det.get('band_energy', 0)):>6.3f}  "
+                            f"{freq_str:>12}\n")
                 else:
                     # 기존 형식 폴백
                     self.txt_result.insert("end", f"  {'시간':>10}  {'점수':>8}\n")
@@ -1026,11 +1233,23 @@ class AnalysisTabMixin:
                 with open(csv_path, "r", encoding="utf-8") as f:
                     reader = csv.DictReader(f)
                     for row in reader:
-                        detections.append({
+                        det_entry = {
                             "species": row.get("species", ""),
                             "time": float(row.get("time", 0)),
                             "score": float(row.get("score", 0)),
-                        })
+                        }
+                        if row.get("det_f_low") and row.get("det_f_high"):
+                            try:
+                                det_entry["det_f_low"] = float(row["det_f_low"])
+                                det_entry["det_f_high"] = float(row["det_f_high"])
+                            except (ValueError, TypeError):
+                                pass
+                        if row.get("detection_pass"):
+                            try:
+                                det_entry["detection_pass"] = int(row["detection_pass"])
+                            except (ValueError, TypeError):
+                                pass
+                        detections.append(det_entry)
             except Exception:
                 pass
 

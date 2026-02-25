@@ -279,6 +279,204 @@ auto_detect_freq_range <- function(wav, t_start = NULL, t_end = NULL) {
   list(f_low = max(0, f_5 - margin), f_high = f_95 + margin, peak = peak)
 }
 
+# ★ 검출 구간별 실제 주파수 바운딩 박스 계산
+# 피크 주파수 기반: 스펙트로그램에서 가장 강한 주파수를 찾고,
+# 피크 에너지의 10% 이상인 대역으로 바운딩 박스를 산출한다.
+detect_freq_bounds <- function(segment, ref_f_low, ref_f_high) {
+  tryCatch(
+    {
+      sr <- segment@samp.rate
+
+      # 2D 스펙트로그램으로 시간-주파수 에너지 분석
+      sp <- tryCatch(
+        spectro(segment, f = sr, plot = FALSE, ovlp = 50,
+                wl = min(1024, 2^floor(log2(length(segment@left) / 2)))),
+        error = function(e) NULL
+      )
+
+      if (is.null(sp)) {
+        # spectro 실패 시 meanspec 폴백
+        spec <- meanspec(segment, f = sr, plot = FALSE)
+        if (is.null(spec) || nrow(spec) < 5) {
+          return(list(det_f_low = ref_f_low, det_f_high = ref_f_high))
+        }
+        freqs <- spec[, 1]  # kHz
+        energy <- spec[, 2]^2
+      } else {
+        freqs <- sp$freq   # kHz
+        amp <- sp$amp      # matrix [freq × time]
+        # 각 프레임에서 피크 주파수 → 중앙값 (로버스트한 피크 추정)
+        energy <- rowMeans(amp^2)  # 평균 에너지 스펙트럼
+      }
+
+      # 템플릿 주파수 범위 내로 제한
+      in_band <- freqs >= ref_f_low & freqs <= ref_f_high
+      if (sum(in_band) < 3) {
+        return(list(det_f_low = ref_f_low, det_f_high = ref_f_high))
+      }
+
+      band_freqs <- freqs[in_band]
+      band_energy <- energy[in_band]
+
+      if (max(band_energy) <= 0) {
+        return(list(det_f_low = ref_f_low, det_f_high = ref_f_high))
+      }
+
+      # ★ 피크 주파수 찾기
+      peak_idx <- which.max(band_energy)
+      peak_energy <- band_energy[peak_idx]
+      peak_freq <- band_freqs[peak_idx]
+
+      # ★ 피크에서 아래/위로 확장: 에너지가 피크의 10% 이상인 구간
+      threshold <- peak_energy * 0.10
+      n <- length(band_freqs)
+
+      # 아래쪽 확장
+      low_idx <- peak_idx
+      for (i in seq(peak_idx - 1, 1, by = -1)) {
+        if (band_energy[i] >= threshold) {
+          low_idx <- i
+        } else {
+          break  # 연속 구간만 포함
+        }
+      }
+
+      # 위쪽 확장
+      high_idx <- peak_idx
+      for (i in seq(peak_idx + 1, n, by = 1)) {
+        if (band_energy[i] >= threshold) {
+          high_idx <- i
+        } else {
+          break
+        }
+      }
+
+      det_low <- band_freqs[low_idx]
+      det_high <- band_freqs[high_idx]
+
+      # 10% 마진 추가
+      margin <- (det_high - det_low) * 0.10
+      det_low <- max(ref_f_low, det_low - margin)
+      det_high <- min(ref_f_high, det_high + margin)
+
+      # 최소 폭 보장 (0.2 kHz)
+      if (det_high - det_low < 0.2) {
+        mid <- (det_low + det_high) / 2
+        det_low <- max(ref_f_low, mid - 0.1)
+        det_high <- min(ref_f_high, mid + 0.1)
+      }
+
+      list(det_f_low = round(det_low, 3), det_f_high = round(det_high, 3))
+    },
+    error = function(e) {
+      list(det_f_low = ref_f_low, det_f_high = ref_f_high)
+    }
+  )
+}
+
+# ★ STFT 마스킹: 검출된 바운딩 박스 영역의 주파수 대역을 제거
+# 2개 이상의 소리가 겹칠 때, 먼저 검출된 소리를 제거하여
+# 숨겨진 소리를 재검출할 수 있도록 한다.
+stft_mask_audio <- function(wav, bboxes, expansion = 1.5) {
+  sr <- wav@samp.rate
+  samples <- as.numeric(wav@left)
+  n <- length(samples)
+
+  if (n < 256 || length(bboxes) == 0) return(wav)
+
+  # STFT 파라미터
+  wl <- 1024L
+  hop <- wl %/% 4L  # 75% 오버랩
+  n_frames <- max(1L, (n - wl) %/% hop + 1L)
+
+  # Hanning 윈도우
+  window_fn <- 0.5 * (1 - cos(2 * pi * (0:(wl - 1)) / wl))
+
+  # 주파수 bin → kHz 매핑 (양수 주파수만, wl/2+1개)
+  n_bins <- wl %/% 2L + 1L
+  freq_khz <- (0:(n_bins - 1L)) * sr / wl / 1000  # kHz
+
+  # 프레임 중심 시간 (초)
+  frame_times <- ((seq_len(n_frames) - 1L) * hop + wl / 2) / sr
+
+  # STFT 순방향: 복소수 행렬 (wl x n_frames)
+  stft <- matrix(complex(real = 0, imaginary = 0), nrow = wl, ncol = n_frames)
+  for (i in seq_len(n_frames)) {
+    s1 <- (i - 1L) * hop + 1L
+    s2 <- s1 + wl - 1L
+    if (s2 > n) {
+      frame <- c(samples[s1:n], rep(0, s2 - n))
+    } else {
+      frame <- samples[s1:s2]
+    }
+    stft[, i] <- fft(frame * window_fn)
+  }
+
+  # 바운딩 박스 마스킹 (50% 확장)
+  for (bbox in bboxes) {
+    t_center <- (bbox$t_start + bbox$t_end) / 2
+    t_half <- (bbox$t_end - bbox$t_start) / 2 * expansion
+    f_center <- (bbox$f_low + bbox$f_high) / 2
+    f_half <- (bbox$f_high - bbox$f_low) / 2 * expansion
+
+    t_lo <- t_center - t_half
+    t_hi <- t_center + t_half
+    f_lo <- max(0, f_center - f_half)
+    f_hi <- f_center + f_half
+
+    # 해당 시간/주파수 bin 마스킹
+    t_mask <- frame_times >= t_lo & frame_times <= t_hi
+    f_mask <- freq_khz >= f_lo & freq_khz <= f_hi
+
+    if (any(t_mask) && any(f_mask)) {
+      f_indices <- which(f_mask)
+      t_indices <- which(t_mask)
+
+      # 양수 주파수 마스킹
+      for (fi in f_indices) {
+        stft[fi, t_indices] <- 0 + 0i
+        # 대칭 (음수 주파수) 마스킹
+        mirror_fi <- wl - fi + 2L
+        if (mirror_fi >= 1L && mirror_fi <= wl && mirror_fi != fi) {
+          stft[mirror_fi, t_indices] <- 0 + 0i
+        }
+      }
+    }
+  }
+
+  # ISTFT: Overlap-Add 복원
+  output <- numeric(n)
+  win_sum <- numeric(n)
+
+  for (i in seq_len(n_frames)) {
+    s1 <- (i - 1L) * hop + 1L
+    s2 <- min(s1 + wl - 1L, n)
+    frame_len <- s2 - s1 + 1L
+
+    reconstructed <- Re(fft(stft[, i], inverse = TRUE)) / wl
+    output[s1:s2] <- output[s1:s2] + reconstructed[1:frame_len] * window_fn[1:frame_len]
+    win_sum[s1:s2] <- win_sum[s1:s2] + window_fn[1:frame_len]^2
+  }
+
+  # 윈도우 합 정규화
+  nonzero <- win_sum > 1e-10
+  output[nonzero] <- output[nonzero] / win_sum[nonzero]
+
+  # 클리핑 방지 정규화
+  peak <- max(abs(output))
+  orig_peak <- max(abs(samples))
+  if (peak > 0 && orig_peak > 0) {
+    output <- output * (orig_peak / peak)
+  }
+
+  # 정수 변환 (원본 bit depth 유지)
+  max_val <- 2^(wav@bit - 1) - 1
+  output <- as.integer(round(pmin(pmax(output, -max_val), max_val)))
+
+  Wave(left = output, samp.rate = sr, bit = wav@bit, pcm = TRUE)
+}
+
+
 validate_and_fix_freq_range <- function(wav, f_low, f_high, t_start = NULL, t_end = NULL) {
   sr <- wav@samp.rate
   nyquist_khz <- sr / 2000
@@ -1038,6 +1236,92 @@ normalize_candidate_scores <- function(df, weights) {
 }
 
 # ============================================================
+# ★ 멀티 템플릿 앙상블: 시간 근접 후보를 그룹핑 후 전략별 집계
+# 동일 시간대에 여러 템플릿이 검출한 경우 최적 점수를 도출
+# ============================================================
+
+#' 멀티 템플릿 앙상블
+#' @param df data.frame (species, time, composite, template_label, 7개 지표...)
+#' @param time_gap 동일 검출로 간주하는 시간 차이 (초, 기본 0.5)
+#' @param strategy "max" | "mean" | "weighted_max"
+#' @return 앙상블 후 data.frame (클러스터당 1행)
+ensemble_multi_template <- function(df, time_gap = 0.5, strategy = "max") {
+  if (nrow(df) <= 1) return(df)
+
+  # 시간순 정렬
+  df <- df[order(df$time), ]
+
+  # Greedy 클러스터링: 시간 차이 > time_gap이면 새 클러스터
+  cluster_id <- integer(nrow(df))
+  cluster_id[1] <- 1
+  for (i in 2:nrow(df)) {
+    if (df$time[i] - df$time[i - 1] > time_gap) {
+      cluster_id[i] <- cluster_id[i - 1] + 1
+    } else {
+      cluster_id[i] <- cluster_id[i - 1]
+    }
+  }
+  df$cluster <- cluster_id
+
+  metric_cols <- c("cor_score", "mfcc_score", "dtw_freq", "dtw_env",
+                   "band_energy", "harmonic_ratio", "snr", "composite")
+  metric_cols <- intersect(metric_cols, names(df))
+
+  # 클러스터별 집계
+  result_rows <- lapply(unique(cluster_id), function(cid) {
+    members <- df[df$cluster == cid, , drop = FALSE]
+
+    if (nrow(members) == 1) {
+      # 단일 멤버 → 그대로 반환
+      row <- members
+      row$n_templates_matched <- 1L
+      row$cluster <- NULL
+      return(row)
+    }
+
+    if (strategy == "max") {
+      # 최고 composite 점수 행 선택
+      best_idx <- which.max(members$composite)
+      row <- members[best_idx, , drop = FALSE]
+      row$n_templates_matched <- nrow(members)
+
+    } else if (strategy == "mean") {
+      # 모든 지표의 평균
+      row <- members[1, , drop = FALSE]
+      for (col in metric_cols) {
+        row[[col]] <- mean(members[[col]], na.rm = TRUE)
+      }
+      row$time <- members$time[which.max(members$composite)]
+      row$template_label <- paste(unique(members$template_label), collapse = "+")
+      row$n_templates_matched <- nrow(members)
+
+    } else if (strategy == "weighted_max") {
+      # cor_score를 가중치로 한 가중평균
+      w <- pmax(members$cor_score, 0.01)
+      w <- w / sum(w)
+      row <- members[1, , drop = FALSE]
+      for (col in metric_cols) {
+        row[[col]] <- round(sum(members[[col]] * w, na.rm = TRUE), 4)
+      }
+      row$time <- members$time[which.max(members$composite)]
+      row$template_label <- paste(unique(members$template_label), collapse = "+")
+      row$n_templates_matched <- nrow(members)
+
+    } else {
+      # 알 수 없는 전략 → max 폴백
+      best_idx <- which.max(members$composite)
+      row <- members[best_idx, , drop = FALSE]
+      row$n_templates_matched <- nrow(members)
+    }
+
+    row$cluster <- NULL
+    row
+  })
+
+  do.call(rbind, result_rows)
+}
+
+# ============================================================
 # ★ 후보 위치 보정: 대역 에너지 포락선 기반 피크 재정렬
 # corMatch는 부분 매칭으로 울음의 시작/끝에 피크가 생기기 쉬움
 # → 대역 에너지가 최대인 실제 울음 중심으로 이동
@@ -1713,6 +1997,18 @@ if (is.null(global_weights$snr)) {
   if (total_w > 0) global_weights <- lapply(global_weights, function(w) w / total_w)
 }
 
+# ★ 주파수 대역 필터링 (2-pass 검출) 옵션
+freq_filter_enabled <- isTRUE(config$freq_filter_enabled)
+if (freq_filter_enabled) {
+  log_info("★ 주파수 대역 필터링 활성화 (2-pass 검출)")
+}
+
+# ★ 단계적 평가 (Staged Evaluation) 옵션
+staged_eval_enabled <- if (!is.null(config$staged_eval)) config$staged_eval else TRUE
+if (isTRUE(staged_eval_enabled)) {
+  log_info("★ 단계적 평가 활성화 (3단계 Early Rejection)")
+}
+
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
 # ============================================================
@@ -2263,11 +2559,15 @@ for (i in seq_along(species_list)) {
         )
         log_debug(sprintf("  frq.lim: [%.3f, %.3f] kHz", freq$f_low, freq$f_high))
 
+        # ★ candidate cutoff: findPeaks가 사용할 낮은 임계값
+        cand_cutoff <- max(0.05, sp$cutoff * CANDIDATE_CUTOFF_RATIO)
+
         pdf(NULL)
         tpl <- makeCorTemplate(sp_fp,
           t.lim   = c(tmpl$t_start, tmpl$t_end),
           frq.lim = c(freq$f_low, freq$f_high),
-          name    = tmpl_name
+          name    = tmpl_name,
+          score.cutoff = cand_cutoff
         )
         dev.off()
 
@@ -2327,6 +2627,17 @@ log_info(sprintf(
   main_sr, length(main_wav@left) / main_sr
 ))
 
+# 1단계 cutoff (makeCorTemplate에서 이미 설정됨)
+candidate_cutoffs <- vapply(template_names, function(tn) {
+  sp_name <- template_to_species[[tn]]
+  sp_conf <- species_list[[match(sp_name, vapply(species_list, `[[`, "", "name"))]]
+  max(0.05, sp_conf$cutoff * CANDIDATE_CUTOFF_RATIO)
+}, numeric(1))
+names(candidate_cutoffs) <- template_names
+log_debug("1단계 cutoff: ", paste(names(candidate_cutoffs), round(candidate_cutoffs, 3),
+  sep = "=", collapse = ", "
+))
+
 scores <- tryCatch(
   {
     s <- corMatch(main_wav_fp, tpls)
@@ -2350,18 +2661,6 @@ detects <- tryCatch(
     stop(e)
   }
 )
-
-# 1단계 cutoff: C5 — 템플릿별로 해당 종의 cutoff 적용
-candidate_cutoffs <- vapply(template_names, function(tn) {
-  sp_name <- template_to_species[[tn]]
-  sp_conf <- species_list[[match(sp_name, vapply(species_list, `[[`, "", "name"))]]
-  max(0.05, sp_conf$cutoff * CANDIDATE_CUTOFF_RATIO)
-}, numeric(1))
-names(candidate_cutoffs) <- template_names
-log_debug("1단계 cutoff: ", paste(names(candidate_cutoffs), round(candidate_cutoffs, 3),
-  sep = "=", collapse = ", "
-))
-templateCutoff(detects) <- candidate_cutoffs
 
 # 후보 수 확인
 for (nm in template_names) {
@@ -2501,6 +2800,8 @@ for (t_idx in seq_along(template_names)) {
   # 각 후보 구간 평가
   sp_results <- vector("list", nrow(det))
   n_refined <- 0
+  n_stage1_reject <- 0
+  n_stage2_reject <- 0
 
   for (j in seq_len(nrow(det))) {
     peak_time_orig <- det$time[j]
@@ -2508,7 +2809,9 @@ for (t_idx in seq_along(template_names)) {
 
     # ★ 피크 위치 보정: 대역 에너지 최대 지점으로 재정렬
     peak_time <- refine_peak_position(band_env, peak_time_orig, ref_duration)
-    if (abs(peak_time - peak_time_orig) > ref_duration * 0.1) {
+    if (is.na(peak_time)) peak_time <- peak_time_orig
+    if (!is.na(peak_time) && !is.na(peak_time_orig) &&
+        abs(peak_time - peak_time_orig) > ref_duration * 0.1) {
       n_refined <- n_refined + 1
     }
 
@@ -2518,6 +2821,7 @@ for (t_idx in seq_along(template_names)) {
     seg_end <- peak_time + ref_duration / 2 + margin
     segment <- extract_segment(main_wav, seg_start, seg_end)
 
+
     if (is.null(segment) || length(segment@left) < 100) {
       sp_results[[j]] <- data.frame(
         species = sp_name, time = peak_time,
@@ -2525,49 +2829,80 @@ for (t_idx in seq_along(template_names)) {
         dtw_env = 0, band_energy = 0, harmonic_ratio = 0, snr = 0,
         composite = cor_score * sp_weights$cor_score,
         template_label = tmpl_name,
+        det_f_low = round(ref_freq$f_low, 3),
+        det_f_high = round(ref_freq$f_high, 3),
+        detection_pass = 1L,
         stringsAsFactors = FALSE
       )
       next
     }
 
-    # --- B5: Staged Evaluation (Early Rejection) ---
-    # 1단계: 빠르게 계산 가능한 지표 (스펙트럼 기반)
+    # --- B5: Staged Evaluation (3단계 계층적 Early Rejection) ---
     individual_scores <- list(cor_score = max(0, cor_score))
+    staged_rejected <- FALSE
+
+    # ── Stage 1: cor + band + snr + MFCC (~61% 가중치) ──
     individual_scores$band_energy <- compute_band_energy_ratio(
-      segment, ref_freq$f_low, ref_freq$f_high
-    )
-    individual_scores$harmonic_ratio <- compute_harmonic_ratio(
       segment, ref_freq$f_low, ref_freq$f_high
     )
     individual_scores$snr <- compute_snr_ratio(
       segment, ref_freq$f_low, ref_freq$f_high
     )
-
-    preliminary <- individual_scores$cor_score * sp_weights$cor_score +
-      individual_scores$band_energy * sp_weights$band_energy +
-      individual_scores$harmonic_ratio * sp_weights$harmonic_ratio +
-      individual_scores$snr * sp_weights$snr
-    remaining_weight <- 1 - sp_weights$cor_score - sp_weights$band_energy -
-      sp_weights$harmonic_ratio - sp_weights$snr
-    max_possible <- preliminary + remaining_weight
-
-    if (max_possible < final_cutoff) {
-      individual_scores$mfcc_score <- 0
-      individual_scores$dtw_freq <- 0
-      individual_scores$dtw_env <- 0
-    } else if (!is.null(ref_wav)) {
+    if (!is.null(ref_wav)) {
       individual_scores$mfcc_score <- compute_mfcc_dtw_similarity(ref_wav, segment)
+    } else {
+      individual_scores$mfcc_score <- 0
+    }
+
+    if (isTRUE(staged_eval_enabled)) {
+      s1_score <- individual_scores$cor_score * sp_weights$cor_score +
+                  individual_scores$band_energy * sp_weights$band_energy +
+                  individual_scores$snr * sp_weights$snr +
+                  individual_scores$mfcc_score * sp_weights$mfcc_score
+      remaining_w1 <- sp_weights$harmonic_ratio + sp_weights$dtw_freq + sp_weights$dtw_env
+      if (s1_score + remaining_w1 < final_cutoff) {
+        n_stage1_reject <- n_stage1_reject + 1
+        individual_scores$harmonic_ratio <- 0
+        individual_scores$dtw_freq <- 0
+        individual_scores$dtw_env <- 0
+        staged_rejected <- TRUE
+      }
+    }
+
+    # ── Stage 2: + harmonic_ratio (~79% 가중치) ──
+    if (!staged_rejected) {
+      individual_scores$harmonic_ratio <- compute_harmonic_ratio(
+        segment, ref_freq$f_low, ref_freq$f_high
+      )
+
+      if (isTRUE(staged_eval_enabled)) {
+        s2_score <- s1_score +
+                    individual_scores$harmonic_ratio * sp_weights$harmonic_ratio
+        remaining_w2 <- sp_weights$dtw_freq + sp_weights$dtw_env
+        if (s2_score + remaining_w2 < final_cutoff) {
+          n_stage2_reject <- n_stage2_reject + 1
+          individual_scores$dtw_freq <- 0
+          individual_scores$dtw_env <- 0
+          staged_rejected <- TRUE
+        }
+      }
+    }
+
+    # ── Stage 3: + dtw_freq + dtw_env (100%) ──
+    if (!staged_rejected && !is.null(ref_wav)) {
       individual_scores$dtw_freq <- compute_freq_contour_dtw(
         ref_wav, segment, ref_freq$f_low, ref_freq$f_high
       )
       individual_scores$dtw_env <- compute_envelope_dtw(ref_wav, segment)
-    } else {
-      individual_scores$mfcc_score <- 0
+    } else if (!staged_rejected) {
       individual_scores$dtw_freq <- 0
       individual_scores$dtw_env <- 0
     }
 
     composite <- compute_composite_score(individual_scores, sp_weights)
+
+    # ★ 검출 구간의 실제 주파수 범위 계산
+    seg_freq_bounds <- detect_freq_bounds(segment, ref_freq$f_low, ref_freq$f_high)
 
     sp_results[[j]] <- data.frame(
       species = sp_name,
@@ -2581,6 +2916,9 @@ for (t_idx in seq_along(template_names)) {
       snr = round(individual_scores$snr, 4),
       composite = round(composite, 4),
       template_label = tmpl_name,
+      det_f_low = seg_freq_bounds$det_f_low,
+      det_f_high = seg_freq_bounds$det_f_high,
+      detection_pass = 1L,
       stringsAsFactors = FALSE
     )
 
@@ -2643,6 +2981,9 @@ for (t_idx in seq_along(template_names)) {
       composite <- compute_composite_score(individual_scores, sp_weights)
 
       n_energy_added <- n_energy_added + 1
+      # ★ 에너지 피크 구간의 실제 주파수 범위 계산
+      ep_freq_bounds <- detect_freq_bounds(segment, ref_freq$f_low, ref_freq$f_high)
+
       sp_results[[length(sp_results) + 1]] <- data.frame(
         species = sp_name,
         time = ep,
@@ -2655,6 +2996,9 @@ for (t_idx in seq_along(template_names)) {
         snr = round(individual_scores$snr, 4),
         composite = round(composite, 4),
         template_label = tmpl_name,
+        det_f_low = ep_freq_bounds$det_f_low,
+        det_f_high = ep_freq_bounds$det_f_high,
+        detection_pass = 1L,
         stringsAsFactors = FALSE
       )
       existing_times <- c(existing_times, ep)
@@ -2667,6 +3011,14 @@ for (t_idx in seq_along(template_names)) {
 
   # 결합
   sp_df <- do.call(rbind, sp_results)
+
+  # ★ Staged eval 통계 출력
+  if (isTRUE(staged_eval_enabled) && (n_stage1_reject > 0 || n_stage2_reject > 0)) {
+    cat(sprintf("  [%s] Staged eval: S1 조기종료 %d건, S2 조기종료 %d건 / 총 %d건 (%.0f%% 절약)\n",
+      tmpl_name, n_stage1_reject, n_stage2_reject, nrow(det),
+      (n_stage1_reject + n_stage2_reject) / max(1, nrow(det)) * 100))
+  }
+
   all_template_results[[tmpl_name]] <- sp_df
 }
 
@@ -2689,6 +3041,21 @@ for (sp_name in species_names_unique) {
 
   combined <- do.call(rbind, sp_dfs)
 
+  # 종 config 조회 (앙상블 + cutoff에서 사용)
+  sp_conf <- species_list[[sp_name_to_idx[sp_name]]]
+
+  # ★ 멀티 템플릿 앙상블 (NMS 전에 적용)
+  ensemble_strategy <- if (!is.null(sp_conf$ensemble_strategy))
+                         sp_conf$ensemble_strategy else "max"
+  nms_gap <- if (!is.null(sp_conf$nms_gap)) sp_conf$nms_gap else 0.5
+  if (length(sp_tmpl_names) > 1 && nrow(combined) > 1) {
+    n_before_ensemble <- nrow(combined)
+    combined <- ensemble_multi_template(combined,
+      time_gap = nms_gap, strategy = ensemble_strategy)
+    cat(sprintf("  [%s] 앙상블 (%s): %d건 → %d건\n",
+      sp_name, ensemble_strategy, n_before_ensemble, nrow(combined)))
+  }
+
   # ★ 후보 간 정규화: 비구별 지표의 상수 기여 제거 → 점수 압축 방지
   sp_w <- template_weights_map[[sp_tmpl_names[1]]]
   if (!is.null(sp_w) && nrow(combined) >= 3) {
@@ -2696,7 +3063,6 @@ for (sp_name in species_names_unique) {
   }
 
   # 최종 cutoff 적용
-  sp_conf <- species_list[[sp_name_to_idx[sp_name]]]
   final_cutoff <- sp_conf$cutoff
 
   sp_df_pass <- combined[combined$composite >= final_cutoff, , drop = FALSE]
@@ -2755,6 +3121,189 @@ for (sp_name in species_names_unique) {
   final_results[[sp_name]] <- combined
 }
 
+# ============================================================
+# ★ Pass 2: 주파수 대역 필터링 (검출된 소리 제거 후 재검출)
+# ============================================================
+if (freq_filter_enabled) {
+  # 1단계: Pass 1에서 검출된 바운딩 박스 수집
+  pass1_bboxes <- list()
+  for (sp_name in names(final_results)) {
+    df <- final_results[[sp_name]]
+    if (is.null(df) || nrow(df) == 0) next
+    df_pass <- df[df$passed == TRUE, , drop = FALSE]
+    if (nrow(df_pass) == 0) next
+
+    for (i in seq_len(nrow(df_pass))) {
+      row <- df_pass[i, ]
+      # 검출 시간 범위: peak_time ± ref_duration/2
+      # 레퍼런스 길이를 추정 (템플릿별로 다르므로 0.5초로 기본)
+      half_dur <- 0.5
+      pass1_bboxes[[length(pass1_bboxes) + 1]] <- list(
+        t_start = row$time - half_dur,
+        t_end = row$time + half_dur,
+        f_low = row$det_f_low,   # kHz
+        f_high = row$det_f_high  # kHz
+      )
+    }
+  }
+
+  if (length(pass1_bboxes) > 0) {
+    cat(sprintf("\n★ Pass 2: %d개 검출 구간 제거 후 재분석 시작\n", length(pass1_bboxes)))
+
+   tryCatch({
+    # 2단계: STFT 마스킹 (50% 확장)
+    masked_wav <- stft_mask_audio(main_wav, pass1_bboxes, expansion = 1.5)
+    cat("  STFT 마스킹 완료\n")
+
+    # 마스킹된 WAV를 임시 파일로 저장 (corMatch 용)
+    masked_wav_fp <- tempfile(fileext = ".wav")
+    writeWave(masked_wav, masked_wav_fp)
+    temp_files <- c(temp_files, masked_wav_fp)
+
+    # 3단계: corMatch 재실행
+    cat("  corMatch 재실행 중...\n")
+    pass2_scores <- tryCatch(
+      corMatch(masked_wav_fp, tpls),
+      error = function(e) {
+        cat(sprintf("  Pass 2 corMatch 실패: %s\n", e$message))
+        NULL
+      }
+    )
+
+    if (!is.null(pass2_scores)) {
+      pass2_detects <- tryCatch(findPeaks(pass2_scores), error = function(e) NULL)
+
+      if (!is.null(pass2_detects)) {
+        # score.cutoff는 makeCorTemplate에서 이미 설정됨 → 별도 설정 불필요
+
+        # 4단계: 각 템플릿별 평가 (Pass 1과 동일 로직)
+        pass2_template_results <- list()
+        for (t_idx in seq_along(template_names)) {
+          tmpl_name <- template_names[t_idx]
+          sp_name <- template_to_species[[tmpl_name]]
+          ref_wav <- template_wavs[[t_idx]]
+          ref_freq <- template_freqs[[t_idx]]
+          det2 <- pass2_detects@detections[[tmpl_name]]
+
+          sp_conf <- species_list[[sp_name_to_idx[sp_name]]]
+          sp_weights <- template_weights_map[[tmpl_name]]
+          if (is.null(sp_weights)) sp_weights <- global_weights
+          final_cutoff <- sp_conf$cutoff
+
+          if (is.null(det2) || nrow(det2) == 0) next
+
+          ref_duration <- if (!is.null(ref_wav)) length(ref_wav@left) / ref_wav@samp.rate else 1.0
+          sp2_results <- list()
+
+          for (j in seq_len(nrow(det2))) {
+            peak_time <- det2[j, "time"]
+            cor_score <- det2[j, "score"]
+            if (is.na(peak_time) || is.na(cor_score)) next
+
+            # Pass 1 검출과 중복되는 시간이면 건너뜀 (0.3초 이내)
+            skip <- FALSE
+            for (bbox in pass1_bboxes) {
+              if (abs(peak_time - (bbox$t_start + bbox$t_end) / 2) < 0.3) {
+                skip <- TRUE
+                break
+              }
+            }
+            if (skip) next
+
+            margin <- ref_duration * 0.2
+            seg_start <- max(0, peak_time - ref_duration / 2 - margin)
+            seg_end <- peak_time + ref_duration / 2 + margin
+            # ★ Pass 2는 마스킹된 음원에서 세그먼트 추출
+            segment <- extract_segment(masked_wav, seg_start, seg_end)
+            if (is.null(segment) || length(segment@left) < 100) next
+
+            individual_scores <- list(cor_score = max(0, cor_score))
+            individual_scores$band_energy <- compute_band_energy_ratio(segment, ref_freq$f_low, ref_freq$f_high)
+            individual_scores$harmonic_ratio <- compute_harmonic_ratio(segment, ref_freq$f_low, ref_freq$f_high)
+            individual_scores$snr <- compute_snr_ratio(segment, ref_freq$f_low, ref_freq$f_high)
+
+            if (!is.null(ref_wav)) {
+              individual_scores$mfcc_score <- compute_mfcc_dtw_similarity(ref_wav, segment)
+              individual_scores$dtw_freq <- compute_freq_contour_dtw(ref_wav, segment, ref_freq$f_low, ref_freq$f_high)
+              individual_scores$dtw_env <- compute_envelope_dtw(ref_wav, segment)
+            } else {
+              individual_scores$mfcc_score <- 0
+              individual_scores$dtw_freq <- 0
+              individual_scores$dtw_env <- 0
+            }
+
+            composite <- compute_composite_score(individual_scores, sp_weights)
+            seg_freq_bounds <- detect_freq_bounds(segment, ref_freq$f_low, ref_freq$f_high)
+
+            sp2_results[[length(sp2_results) + 1]] <- data.frame(
+              species = sp_name, time = peak_time,
+              cor_score = round(individual_scores$cor_score, 4),
+              mfcc_score = round(individual_scores$mfcc_score, 4),
+              dtw_freq = round(individual_scores$dtw_freq, 4),
+              dtw_env = round(individual_scores$dtw_env, 4),
+              band_energy = round(individual_scores$band_energy, 4),
+              harmonic_ratio = round(individual_scores$harmonic_ratio, 4),
+              snr = round(individual_scores$snr, 4),
+              composite = round(composite, 4),
+              template_label = tmpl_name,
+              det_f_low = seg_freq_bounds$det_f_low,
+              det_f_high = seg_freq_bounds$det_f_high,
+              detection_pass = 2L,
+              stringsAsFactors = FALSE
+            )
+          }
+
+          if (length(sp2_results) > 0) {
+            pass2_template_results[[tmpl_name]] <- do.call(rbind, sp2_results)
+          }
+        }
+
+        # 5단계: Pass 2 결과를 final_results에 병합
+        n_pass2_total <- 0
+        for (sp_name in species_names_unique) {
+          sp_tmpl_names <- template_names[vapply(template_names, function(tn) {
+            template_to_species[[tn]] == sp_name
+          }, logical(1))]
+
+          sp2_dfs <- lapply(sp_tmpl_names, function(tn) pass2_template_results[[tn]])
+          sp2_dfs <- sp2_dfs[!vapply(sp2_dfs, is.null, logical(1))]
+          if (length(sp2_dfs) == 0) next
+
+          sp2_combined <- do.call(rbind, sp2_dfs)
+          sp_conf <- species_list[[sp_name_to_idx[sp_name]]]
+          final_cutoff <- sp_conf$cutoff
+
+          sp2_combined$passed <- sp2_combined$composite >= final_cutoff
+          n_pass2 <- sum(sp2_combined$passed, na.rm = TRUE)
+          n_pass2_total <- n_pass2_total + n_pass2
+
+          if (n_pass2 > 0) {
+            cat(sprintf("  [%s] Pass 2: %d건 추가 검출\n", sp_name, n_pass2))
+          }
+
+          # 기존 결과에 병합
+          existing <- final_results[[sp_name]]
+          if (!is.null(existing)) {
+            # 컬럼 정렬: Pass 1/2 결과의 컬럼이 다를 수 있음
+            all_cols <- union(names(existing), names(sp2_combined))
+            for (col in setdiff(all_cols, names(existing)))    existing[[col]] <- NA
+            for (col in setdiff(all_cols, names(sp2_combined))) sp2_combined[[col]] <- NA
+            final_results[[sp_name]] <- rbind(existing[all_cols], sp2_combined[all_cols])
+          } else {
+            final_results[[sp_name]] <- sp2_combined
+          }
+        }
+
+        cat(sprintf("★ Pass 2 완료: 총 %d건 추가 검출\n\n", n_pass2_total))
+      }
+    }
+   }, error = function(e) {
+     cat(sprintf("\n★ Pass 2 오류 (무시하고 계속): %s\n\n", e$message))
+   })
+  } else {
+    cat("\n★ Pass 2 건너뜀: Pass 1에서 검출된 소리가 없습니다.\n\n")
+  }
+}
 
 # ============================================================
 # 결과 저장
@@ -2779,7 +3328,7 @@ pass_list <- lapply(names(final_results), function(nm) {
   df_pass[, c(
     "species", "template_label", "time_display", "time", "composite",
     "cor_score", "mfcc_score", "dtw_freq", "dtw_env", "band_energy",
-    "harmonic_ratio"
+    "harmonic_ratio", "det_f_low", "det_f_high", "detection_pass"
   )]
 })
 pass_list <- pass_list[!vapply(pass_list, is.null, logical(1))]
@@ -2792,7 +3341,8 @@ if (length(pass_list) > 0) {
     time_display = character(), time = numeric(),
     composite = numeric(), cor_score = numeric(), mfcc_score = numeric(),
     dtw_freq = numeric(), dtw_env = numeric(), band_energy = numeric(),
-    harmonic_ratio = numeric(),
+    harmonic_ratio = numeric(), det_f_low = numeric(), det_f_high = numeric(),
+    detection_pass = integer(),
     stringsAsFactors = FALSE
   )
 }
@@ -2801,7 +3351,7 @@ if (length(pass_list) > 0) {
 compat_csv <- results_csv
 if (nrow(compat_csv) > 0) {
   compat_csv$score <- compat_csv$composite
-  compat_csv <- compat_csv[, c("species", "time_display", "time", "score")]
+  compat_csv <- compat_csv[, c("species", "time_display", "time", "score", "det_f_low", "det_f_high", "detection_pass")]
 }
 write.csv(compat_csv, file.path(output_dir, "results.csv"),
   row.names = FALSE, fileEncoding = "UTF-8"
@@ -2846,6 +3396,10 @@ tryCatch(
         list(
           time = round(row$time, 3),
           time_display = sprintf("%02d:%04.1f", floor(row$time / 60), row$time %% 60),
+          freq_range = list(
+            f_low = round(row$det_f_low, 3),
+            f_high = round(row$det_f_high, 3)
+          ),
           scores = list(
             composite = round(row$composite, 4),
             cor_score = round(row$cor_score, 4),
@@ -2854,7 +3408,8 @@ tryCatch(
             dtw_env = round(row$dtw_env, 4),
             band_energy = round(row$band_energy, 4),
             harmonic_ratio = round(row$harmonic_ratio, 4)
-          )
+          ),
+          detection_pass = if (!is.null(row$detection_pass)) row$detection_pass else 1L
         )
       })
 

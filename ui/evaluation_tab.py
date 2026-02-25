@@ -772,8 +772,15 @@ class EvaluationTabMixin:
         ))
 
         if not files_in_results:
-            messagebox.showinfo("안내", "파일 정보가 없어 시각화할 수 없습니다.")
-            return
+            # 단일 파일 분석: annotation/분석탭에서 파일명 추론
+            fallback = self._eval_infer_filename()
+            if not fallback:
+                messagebox.showinfo("안내", "파일 정보가 없어 시각화할 수 없습니다.")
+                return
+            files_in_results = [fallback]
+            for r in self._eval_match_results:
+                if not r.file:
+                    r.file = fallback
 
         # WAV 파일 선택 (또는 이미 연 파일 역참조)
         if len(files_in_results) == 1:
@@ -896,6 +903,37 @@ class EvaluationTabMixin:
         ttk.Button(win, text="확인", command=on_ok).pack(pady=5)
         win.wait_window()
         return selected[0]
+
+    def _eval_infer_filename(self):
+        """매칭 결과에 file 정보가 없을 때 파일명 추론"""
+        # 1) annotation에서 비어 있지 않은 file 필드 탐색
+        if self._eval_annotations:
+            for ann in self._eval_annotations:
+                f = ann.get("file", "").strip()
+                if f:
+                    return f
+
+        # 2) 분석 탭의 WAV 경로에서 basename 추출
+        if hasattr(self, "var_main_wav"):
+            wav = self.var_main_wav.get().strip()
+            if wav:
+                return os.path.basename(wav)
+
+        # 3) output_dir의 config.json에서 main_wav 추출
+        if hasattr(self, "output_dir") and self.output_dir:
+            config_path = Path(self.output_dir) / "config.json"
+            if config_path.exists():
+                try:
+                    import json
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        config = json.load(f)
+                    main_wav = config.get("main_wav", "")
+                    if main_wav:
+                        return os.path.basename(main_wav)
+                except Exception:
+                    pass
+
+        return None
 
     def _eval_find_wav_path(self, filename):
         """파일명으로 WAV 경로 탐색"""

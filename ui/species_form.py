@@ -119,6 +119,13 @@ def create_species_form(
         ttk.Spinbox(row0, textvariable=var_cutoff, from_=0.0, to=1.0,
                     width=5, increment=0.05).pack(side="left")
 
+    # ── 앙상블 전략 (멀티 템플릿 시) ──
+    var_ensemble = tk.StringVar(value="max")
+    ttk.Label(row0, text="  앙상블:").pack(side="left")
+    ttk.Combobox(row0, textvariable=var_ensemble,
+                 values=["max", "mean", "weighted_max"],
+                 width=12, state="readonly").pack(side="left", padx=2)
+
     # ── C5: 멀티 템플릿 영역 ──
     tmpl_container = ttk.LabelFrame(frm, text="템플릿 목록", padding=2)
     tmpl_container.pack(fill="x", pady=(3, 0))
@@ -194,6 +201,7 @@ def create_species_form(
         "frame":     frm,
         "name":      var_name,
         "templates": templates,   # C5: 템플릿 리스트 (동적)
+        "ensemble":  var_ensemble,  # 앙상블 전략
     }
     if include_cutoff:
         result["cutoff"] = var_cutoff

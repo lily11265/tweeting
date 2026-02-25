@@ -1,5 +1,5 @@
 # ============================================================
-# 조류 음성 탐지기 - Python tkinter GUI
+# tweeting - Python tkinter GUI
 # 내부 분석: R (monitoR, seewave, tuneR)
 # 외부 GUI: Python tkinter
 # ============================================================
@@ -12,7 +12,10 @@
 
 import tkinter as tk
 from tkinter import ttk
+import os
 import sys
+import atexit
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -48,7 +51,7 @@ from ui.converter_tab import ConverterTabMixin
 class BirdSongDetectorApp(AnalysisTabMixin, BatchTabMixin, EvaluationTabMixin, ConverterTabMixin):
     def __init__(self, root):
         self.root = root
-        self.root.title("🐦 조류 음성 탐지기 (Bird Song Detector)")
+        self.root.title("tweeting")
         self.root.geometry("1050x800")
         self.root.minsize(950, 700)
 
@@ -68,7 +71,9 @@ class BirdSongDetectorApp(AnalysisTabMixin, BatchTabMixin, EvaluationTabMixin, C
         self.rscript_path = find_rscript()
 
         # 결과 임시 폴더
+        self._created_temp_dirs = []  # 종료 시 정리할 임시 디렉터리 목록
         self.output_dir = Path(tempfile.mkdtemp(prefix="birdsong_"))
+        self._created_temp_dirs.append(str(self.output_dir))
 
         # 종 정보 저장 리스트
         self.species_frames = []
@@ -82,6 +87,10 @@ class BirdSongDetectorApp(AnalysisTabMixin, BatchTabMixin, EvaluationTabMixin, C
         self._batch_wav_map = {}
 
         self._build_ui()
+
+        # 종료 시 임시 폴더 정리 등록
+        atexit.register(self._cleanup_temp_dirs)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ========================================
     # UI 구성
@@ -111,16 +120,43 @@ class BirdSongDetectorApp(AnalysisTabMixin, BatchTabMixin, EvaluationTabMixin, C
         self.notebook.add(tab_eval, text="  📊 성능 평가  ")
         self._build_evaluation_tab(tab_eval)
 
-        # --- 탭 5: MP3 → WAV 변환기 ---
+        # --- 탭 5: MP3/MP4 → WAV 변환기 ---
         tab_converter = ttk.Frame(self.notebook)
-        self.notebook.add(tab_converter, text="  🔄 MP3 → WAV 변환  ")
+        self.notebook.add(tab_converter, text="  🔄 MP3/MP4 → WAV 변환  ")
         self._build_converter_tab(tab_converter)
+
+    # ========================================
+    # 임시 디렉터리 정리
+    # ========================================
+    def _cleanup_temp_dirs(self):
+        """추적된 모든 임시 디렉터리를 삭제한다."""
+        for d in self._created_temp_dirs:
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+        self._created_temp_dirs.clear()
+
+    def _on_close(self):
+        """프로그램 종료 시 정리 후 종료."""
+        self._cleanup_temp_dirs()
+        self.root.destroy()
 
 
 # ============================================================
 # 실행
 # ============================================================
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+
+    # PyInstaller --windowed 모드에서는 sys.stdout/stderr 가 None이므로
+    # print() 호출 시 'NoneType' has no attribute 'write' 방지
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
     root = tk.Tk()
     app = BirdSongDetectorApp(root)
     root.mainloop()

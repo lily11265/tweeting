@@ -211,6 +211,44 @@ def prepare_filtered_wav(data: np.ndarray, sr: int,
     return tmp_path, actual_duration
 
 
+def prepare_filtered_pcm(data: np.ndarray, sr: int,
+                         t0: float, t1: float,
+                         f_low: float, f_high: float,
+                         speed: float = 1.0,
+                         volume: float = 1.0):
+    """
+    시간+주파수 범위로 필터링된 PCM 데이터를 인메모리로 반환.
+    WAV 파일을 생성하지 않는다.
+
+    Returns:
+        (pcm_int16, sr, actual_duration) or (None, 0, 0.0)
+    """
+    i0 = max(0, int(t0 * sr))
+    i1 = min(len(data), int(t1 * sr))
+    segment = data[i0:i1].copy()
+
+    if len(segment) < 64:
+        return None, 0, 0.0
+
+    nyq = sr / 2.0
+    if f_low > 1.0 or f_high < nyq - 1:
+        segment = bandpass_filter(segment, sr, f_low, f_high)
+
+    if abs(speed - 1.0) > 0.01 and HAS_RESAMPLE:
+        new_len = int(len(segment) / speed)
+        if new_len < 64:
+            new_len = 64
+        segment = scipy_resample(segment, new_len)
+
+    max_val = np.max(np.abs(segment))
+    if max_val > 0:
+        segment = segment / max_val
+    pcm = (segment * 32767 * volume).astype(np.int16)
+
+    actual_duration = (t1 - t0) / speed
+    return pcm, sr, actual_duration
+
+
 def prepare_polygon_wav(data: np.ndarray, sr: int,
                         polygon_points: list,
                         speed: float = 1.0,
@@ -279,3 +317,49 @@ def prepare_polygon_wav(data: np.ndarray, sr: int,
 
     actual_duration = (t1 - t0) / speed
     return tmp_path, actual_duration
+
+
+def prepare_polygon_pcm(data: np.ndarray, sr: int,
+                        polygon_points: list,
+                        speed: float = 1.0,
+                        volume: float = 1.0):
+    """
+    폴리곤 영역으로 필터링된 PCM 데이터를 인메모리로 반환.
+    WAV 파일을 생성하지 않는다.
+
+    Returns:
+        (pcm_int16, sr, actual_duration) or (None, 0, 0.0)
+    """
+    if len(polygon_points) < 3:
+        return None, 0, 0.0
+
+    times = [p[0] for p in polygon_points]
+    t0 = max(0, min(times))
+    t1 = min(len(data) / sr, max(times))
+
+    if t1 - t0 < 0.01:
+        return None, 0, 0.0
+
+    i0 = max(0, int(t0 * sr))
+    i1 = min(len(data), int(t1 * sr))
+    segment = data[i0:i1].copy()
+
+    if len(segment) < 64:
+        return None, 0, 0.0
+
+    offset_points = [(t - t0, f) for t, f in polygon_points]
+    segment = polygon_mask_filter(segment, sr, offset_points)
+
+    if abs(speed - 1.0) > 0.01 and HAS_RESAMPLE:
+        new_len = int(len(segment) / speed)
+        if new_len < 64:
+            new_len = 64
+        segment = scipy_resample(segment, new_len)
+
+    max_val = np.max(np.abs(segment))
+    if max_val > 0:
+        segment = segment / max_val
+    pcm = (segment * 32767 * volume).astype(np.int16)
+
+    actual_duration = (t1 - t0) / speed
+    return pcm, sr, actual_duration

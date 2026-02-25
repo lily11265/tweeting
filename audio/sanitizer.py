@@ -27,9 +27,10 @@ except ImportError:
 
 # 파일 선택 다이얼로그용 필터
 AUDIO_FILETYPES = [
-    ("음원 파일", "*.wav *.mp3"),
+    ("음원 파일", "*.wav *.mp3 *.mp4"),
     ("WAV 파일", "*.wav"),
     ("MP3 파일", "*.mp3"),
+    ("MP4 파일", "*.mp4"),
 ]
 
 
@@ -52,6 +53,40 @@ def convert_mp3_to_wav(mp3_path, wav_path=None):
         # pydub 없으면 ffmpeg 직접 호출
         subprocess.run(
             ["ffmpeg", "-y", "-i", str(mp3_path), str(wav_path)],
+            capture_output=True, check=True
+        )
+    return str(wav_path)
+
+
+def convert_media_to_wav(input_path, wav_path=None):
+    """
+    MP3 또는 MP4 파일을 WAV로 변환.
+    wav_path가 None이면 같은 폴더에 .wav 확장자로 저장.
+    반환: 변환된 WAV 파일 경로
+    """
+    input_path = Path(input_path)
+    if wav_path is None:
+        wav_path = input_path.with_suffix(".wav")
+    else:
+        wav_path = Path(wav_path)
+
+    ext = input_path.suffix.lower()
+
+    if ext == ".mp3":
+        return convert_mp3_to_wav(input_path, wav_path)
+
+    # MP4 (또는 기타 ffmpeg 지원 포맷) → WAV
+    if HAS_PYDUB:
+        # pydub는 ffmpeg를 내부적으로 사용하여 MP4 오디오 추출
+        audio = AudioSegment.from_file(str(input_path))
+        audio.export(str(wav_path), format="wav")
+    else:
+        # ffmpeg 직접 호출 (오디오 트랙만 추출)
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(input_path),
+             "-vn",  # 비디오 스트림 제외
+             "-acodec", "pcm_s16le",  # 16-bit PCM
+             str(wav_path)],
             capture_output=True, check=True
         )
     return str(wav_path)
@@ -282,26 +317,110 @@ def sanitize_wav(wav_path, output_path=None, target_sr=48000, target_bits=16):
     return str(output_path), "\n".join(log_lines)
 
 
+def _needs_sanitize(wav_path, target_sr=48000, target_bits=16):
+    """
+    WAV 파일의 헤더만 읽어 sanitize 필요 여부를 빠르게 판단.
+    대용량 파일도 헤더(최대 4KB) 만 읽으므로 즉시 반환.
+    Returns: (needs: bool, log: str)
+    """
+    wav_path = Path(wav_path)
+    try:
+        with open(wav_path, "rb") as f:
+            header = f.read(4096)  # 헤더 + 청크 정보만 읽기
+    except Exception:
+        return True, "[needs_sanitize] 파일 읽기 실패"
+
+    if len(header) < 44:
+        return True, "[needs_sanitize] 파일 너무 작음"
+
+    if header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+        return True, "[needs_sanitize] WAV 형식 아님"
+
+    # 청크 파싱 (헤더 범위 안에서만)
+    pos = 12
+    fmt_offset = None
+    fmt_size = 0
+    extra_chunks = []
+
+    while pos < len(header) - 8:
+        chunk_id = header[pos:pos + 4]
+        chunk_sz = struct.unpack_from("<I", header, pos + 4)[0]
+
+        if chunk_id == b"fmt ":
+            fmt_offset = pos + 8
+            fmt_size = chunk_sz
+        elif chunk_id == b"data":
+            pass  # data 청크는 무시
+        else:
+            extra_chunks.append(chunk_id.decode("ascii", errors="?"))
+
+        pos += 8 + chunk_sz
+        if pos % 2 != 0:
+            pos += 1
+
+    if fmt_offset is None:
+        return True, "[needs_sanitize] fmt 청크 없음"
+
+    fmt_data = header[fmt_offset:fmt_offset + min(fmt_size, 40)]
+    if len(fmt_data) < 16:
+        return True, "[needs_sanitize] fmt 데이터 부족"
+
+    audio_format = struct.unpack_from("<H", fmt_data, 0)[0]
+    n_channels = struct.unpack_from("<H", fmt_data, 2)[0]
+    sample_rate = struct.unpack_from("<I", fmt_data, 4)[0]
+    bits_per_sample = struct.unpack_from("<H", fmt_data, 14)[0]
+
+    reasons = []
+    if fmt_size != 16 and audio_format == 1:
+        reasons.append(f"fmt 크기 {fmt_size}→16")
+    if bits_per_sample != target_bits:
+        reasons.append(f"{bits_per_sample}bit→{target_bits}bit")
+    if n_channels > 1:
+        reasons.append(f"{n_channels}ch→mono")
+    if sample_rate > target_sr:
+        reasons.append(f"{sample_rate}Hz→{target_sr}Hz")
+    if extra_chunks:
+        reasons.append(f"비표준 청크: {extra_chunks}")
+
+    if reasons:
+        return True, f"[needs_sanitize] 변환 필요: {', '.join(reasons)}"
+    return False, "[needs_sanitize] 변환 불필요 (표준 형식)"
+
+
 def ensure_wav(file_path, temp_dir):
     """
     파일이 MP3이면 WAV로 변환, WAV이면 그대로 반환.
     모든 WAV는 tuneR 호환을 위해 sanitize (16-bit mono ≤48kHz).
     변환된 파일은 temp_dir에 저장 (원본 보호).
+
+    ※ 이미 표준 형식인 WAV는 복사 없이 원본 경로를 반환하여
+    대용량 파일의 불필요한 디스크 복사를 방지.
+
     반환: (wav경로, 로그문자열)
     """
     file_path = Path(file_path)
     logs = []
 
-    if file_path.suffix.lower() == ".mp3":
+    if file_path.suffix.lower() in (".mp3", ".mp4"):
         wav_name = file_path.stem + ".wav"
         wav_path = Path(temp_dir) / wav_name
-        convert_mp3_to_wav(file_path, wav_path)
-        logs.append(f"[ensure_wav] MP3→WAV 변환: {file_path.name}")
+        fmt_label = file_path.suffix.upper().lstrip(".")
+        convert_media_to_wav(file_path, wav_path)
+        logs.append(f"[ensure_wav] {fmt_label}→WAV 변환: {file_path.name}")
         result_path, san_log = sanitize_wav(wav_path)
         logs.append(san_log)
         return result_path, "\n".join(logs)
 
-    # WAV 파일 → temp_dir에 복사 후 sanitize (원본 보호)
+    # WAV 파일 → 먼저 헤더만 읽어 sanitize 필요 여부 확인
+    needs, check_log = _needs_sanitize(file_path)
+    logs.append(check_log)
+
+    if not needs:
+        # 표준 형식 → 원본 경로 그대로 사용 (복사 불필요!)
+        logs.append(f"[ensure_wav] ✅ 원본 사용 (복사 생략): {file_path.name}")
+        return str(file_path), "\n".join(logs)
+
+    # 변환 필요 → temp_dir에 복사 후 sanitize (원본 보호)
     sanitized_path = Path(temp_dir) / file_path.name
     if str(sanitized_path.resolve()) != str(file_path.resolve()):
         try:
