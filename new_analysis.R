@@ -1445,6 +1445,80 @@ find_energy_peaks <- function(energy_env, ref_duration) {
 }
 
 # ============================================================
+# ★ Rank-Biserial Correlation 헬퍼 함수
+#   자동 튜닝에서 Cohen's d 대신 사용하는 비모수적 효과 크기 측정
+#   - 분포 가정 불필요 (정규분포 위반에 강건)
+#   - 이상치에 강건 (순위 기반)
+#   - 소표본에서 안정적
+# ============================================================
+
+#' Rank-Biserial Correlation 계산 (Mann-Whitney U 기반)
+#'
+#' Wendt 공식: r_rb = 2U/(n1×n2) - 1
+#' 양성 집단의 순위 우위 정도를 [-1, 1] 범위로 반환한다.
+#'
+#' @param pos_vals 양성 샘플 값 벡터
+#' @param neg_vals 음성 샘플 값 벡터
+#' @return list(r_rb, U, p_value, n_pos, n_neg)
+compute_rank_biserial <- function(pos_vals, neg_vals) {
+  n1 <- length(pos_vals)
+  n2 <- length(neg_vals)
+
+  if (n1 < 2 || n2 < 2) {
+    return(list(r_rb = 0, U = NA, p_value = 1, n_pos = n1, n_neg = n2))
+  }
+
+  # Mann-Whitney U 검정 (동순위 보정 자동 적용)
+  wt <- tryCatch(
+    suppressWarnings(wilcox.test(pos_vals, neg_vals,
+      exact = FALSE,           # 동순위 시 정규 근사 사용
+      correct = TRUE,          # 연속 보정
+      alternative = "greater"  # 양성 > 음성 방향
+    )),
+    error = function(e) NULL
+  )
+
+  if (is.null(wt)) {
+    return(list(r_rb = 0, U = NA, p_value = 1, n_pos = n1, n_neg = n2))
+  }
+
+  U <- as.numeric(wt$statistic)
+  p_value <- wt$p.value
+
+  # R의 wilcox.test U = "x가 y보다 큰 쌍의 수"
+  # r_rb = 2*U/(n1*n2) - 1 → 양성>음성일 때 양수
+  r_rb <- (2 * U) / (n1 * n2) - 1
+
+  list(r_rb = r_rb, U = U, p_value = p_value, n_pos = n1, n_neg = n2)
+}
+
+#' MAD 기반 Robust 크기 효과 계산
+#'
+#' Rank-Biserial 포화 구간(r_rb ≈ 1.0)에서 지표 간 차등을 위한 보조 지표.
+#' 중앙값과 MAD(Median Absolute Deviation)를 사용하여
+#' 이상치에 강건한 크기 정보를 제공한다.
+#'
+#' @param pos_vals 양성 샘플 값 벡터
+#' @param neg_vals 음성 샘플 값 벡터
+#' @return robust magnitude (0 이상)
+compute_robust_magnitude <- function(pos_vals, neg_vals) {
+  med_pos <- median(pos_vals, na.rm = TRUE)
+  med_neg <- median(neg_vals, na.rm = TRUE)
+
+  # MAD × 1.4826: 정규분포에서 SD와 일치하는 보정계수
+  mad_pos <- mad(pos_vals, constant = 1.4826, na.rm = TRUE)
+  mad_neg <- mad(neg_vals, constant = 1.4826, na.rm = TRUE)
+  mad_pooled <- sqrt((mad_pos^2 + mad_neg^2) / 2)
+
+  if (is.na(mad_pooled) || mad_pooled < 0.001) {
+    # MAD가 극소 (값이 거의 동일) → 중앙값 차이 자체를 스케일링
+    return(abs(med_pos - med_neg) * 10)
+  }
+
+  abs(med_pos - med_neg) / mad_pooled
+}
+
+# ============================================================
 # ★ 자동 튜닝: 종 음원 자가진단으로 최적 가중치 결정
 # ============================================================
 #' 종 음원 내에서 자가진단을 수행하여 최적 가중치를 자동으로 결정한다.
@@ -1782,7 +1856,7 @@ auto_tune_weights <- function(wav, templates_info) {
     n_pos, n_neg, sim_threshold, length(pos_indices), length(neg_indices)
   ))
 
-  # ★ 최소 3건씩 필요 (n=1~2에서는 sd, Cohen's d 계산이 불안정)
+  # ★ 최소 3건씩 필요 (n=1~2에서는 Mann-Whitney U 통계량이 불안정)
   if (n_pos < 3 || n_neg < 3) {
     log_info(sprintf(
       "  ⚠ 샘플 부족 (양성=%d, 음성=%d, 최소=3) → 기본 가중치 사용", n_pos, n_neg
@@ -1800,8 +1874,9 @@ auto_tune_weights <- function(wav, templates_info) {
   }
 
   # 6) 각 지표별 변별력(discriminative power) 계산
-  #    LOO 교차검증: 각 샘플을 한 번씩 제외하고 Cohen's d를 계산,
-  #    평균을 취해 과적합 방지
+  #    Rank-Biserial Correlation (Mann-Whitney U 기반) 하이브리드 방식:
+  #    - 1차: 순위 기반 r_rb로 분포 가정 없이 변별력 측정
+  #    - 2차: 포화(r_rb≈1.0) 시 MAD 기반 robust magnitude로 보정
   metric_names <- c("cor_score", "mfcc_score", "dtw_freq", "dtw_env", "band_energy", "harmonic_ratio", "snr")
   disc_power <- numeric(length(metric_names))
   names(disc_power) <- metric_names
@@ -1811,8 +1886,11 @@ auto_tune_weights <- function(wav, templates_info) {
   names(pos_means) <- metric_names
   names(neg_means) <- metric_names
 
-  n_all <- n_pos + n_neg
-  use_loo <- (n_pos >= 5 && n_neg >= 5) # LOO는 최소 5개 이상일 때만
+  # Rank-Biserial 진단 정보
+  rb_values <- numeric(length(metric_names))
+  p_values <- numeric(length(metric_names))
+  names(rb_values) <- metric_names
+  names(p_values) <- metric_names
 
   for (mi in seq_along(metric_names)) {
     mn <- metric_names[mi]
@@ -1825,51 +1903,35 @@ auto_tune_weights <- function(wav, templates_info) {
       if (is.null(v) || is.na(v) || is.nan(v)) 0 else v
     })
 
-    pos_mean <- mean(pos_vals, na.rm = TRUE)
-    neg_mean <- mean(neg_vals, na.rm = TRUE)
-    pos_means[mi] <- pos_mean
-    neg_means[mi] <- neg_mean
+    pos_means[mi] <- mean(pos_vals, na.rm = TRUE)
+    neg_means[mi] <- mean(neg_vals, na.rm = TRUE)
 
-    if (use_loo) {
-      # LOO 교차검증: 각 샘플 제외 후 Cohen's d 계산
-      loo_ds <- numeric(n_all)
+    # ★ Rank-Biserial Correlation 계산
+    rb_result <- compute_rank_biserial(pos_vals, neg_vals)
+    rb_values[mi] <- rb_result$r_rb
+    p_values[mi] <- rb_result$p_value
 
-      for (li in seq_len(n_all)) {
-        if (li <= n_pos) {
-          # 양성 샘플 하나 제외
-          loo_pos <- pos_vals[-li]
-          loo_neg <- neg_vals
-        } else {
-          # 음성 샘플 하나 제외
-          loo_pos <- pos_vals
-          loo_neg <- neg_vals[-(li - n_pos)]
-        }
+    # ★ 하이브리드 변별력: r_rb + 포화 시 MAD 보정
+    r_rb <- rb_result$r_rb
 
-        pm <- mean(loo_pos, na.rm = TRUE)
-        nm <- mean(loo_neg, na.rm = TRUE)
-        ps <- sd(loo_pos, na.rm = TRUE)
-        ns <- sd(loo_neg, na.rm = TRUE)
-        ps_d <- sqrt((ps^2 + ns^2) / 2)
-        if (is.na(ps_d) || ps_d < 0.001) ps_d <- 0.001
-        loo_ds[li] <- max(0, (pm - nm) / ps_d)
-      }
-
-      disc_power[mi] <- mean(loo_ds)
+    if (r_rb <= 0) {
+      # 역방향 또는 무변별 → 0
+      disc_power[mi] <- 0
+    } else if (r_rb > 0.95 && n_pos >= 5 && n_neg >= 5) {
+      # 포화 구간: MAD 기반 robust magnitude로 지표 간 차등 부여
+      magnitude <- compute_robust_magnitude(pos_vals, neg_vals)
+      disc_power[mi] <- r_rb * (1 + log1p(magnitude))
     } else {
-      # 샘플 부족 시 기존 방식
-      pos_sd <- sd(pos_vals, na.rm = TRUE)
-      neg_sd <- sd(neg_vals, na.rm = TRUE)
-      pooled_sd <- sqrt((pos_sd^2 + neg_sd^2) / 2)
-      if (is.na(pooled_sd) || pooled_sd < 0.001) pooled_sd <- 0.001
-      disc_power[mi] <- max(0, (pos_mean - neg_mean) / pooled_sd)
+      disc_power[mi] <- r_rb
     }
   }
 
-  log_info(sprintf("  지표별 변별력%s:", if (use_loo) " (LOO 교차검증)" else ""))
+  log_info("  지표별 변별력 (Rank-Biserial 하이브리드):")
   for (mn in metric_names) {
+    saturated_mark <- if (rb_values[mn] > 0.95 && n_pos >= 5 && n_neg >= 5) " [포화보정]" else ""
     log_info(sprintf(
-      "    %s: 양성=%.3f, 음성=%.3f → 변별력=%.3f",
-      mn, pos_means[mn], neg_means[mn], disc_power[mn]
+      "    %s: 양성=%.3f, 음성=%.3f → r_rb=%.3f (p=%.4f) → 변별력=%.3f%s",
+      mn, pos_means[mn], neg_means[mn], rb_values[mn], p_values[mn], disc_power[mn], saturated_mark
     ))
   }
 
@@ -1898,7 +1960,7 @@ auto_tune_weights <- function(wav, templates_info) {
     raw_weights <- sqrt(disc_power) / sum(sqrt(disc_power))
 
     # ★ 최소 가중치 제거: 변별력 없는 지표는 가중치 0
-    # (기존 min_w=0.05가 비구별 지표의 상수 기여를 유발하여 점수 압축)
+    # (비구별 지표의 상수 기여를 유발하여 점수 압축 방지)
     optimal_weights <- as.list(raw_weights)
     names(optimal_weights) <- metric_names
   }
@@ -1920,6 +1982,8 @@ auto_tune_weights <- function(wav, templates_info) {
       positive_means = as.list(pos_means),
       negative_means = as.list(neg_means),
       discriminative_power = as.list(disc_power),
+      rank_biserial = as.list(rb_values),
+      p_values = as.list(p_values),
       sim_threshold = sim_threshold
     )
   )
